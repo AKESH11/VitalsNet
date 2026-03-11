@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(BioVaultCore VERSION 1.0.0 LANGUAGES CXX)
+adb logcat -d -s ContentClassifierproject(BioVaultCore VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -68,6 +68,7 @@ set(SOURCES
     src/consensus_handshake.cpp
     src/proof_of_reality.cpp
     src/bio_vault_native.cpp
+    src/watermark.cpp
 )
 
 set(HEADERS
@@ -77,6 +78,7 @@ set(HEADERS
     include/consensus_handshake.h
     include/proof_of_reality.h
     include/bio_vault_native.h
+    include/watermark.h
 )
 
 if(HAVE_OPENCV)

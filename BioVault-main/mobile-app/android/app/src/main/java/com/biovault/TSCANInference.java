@@ -602,6 +602,41 @@ public class TSCANInference {
         }
     }
     
+    /**
+     * Get accumulated BPM summary for the entire session.
+     * Returns the median-smoothed BPM, confidence, and inference count.
+     */
+    public InferenceResult getAccumulatedBPM() {
+        if (bpmHistory == null || bpmHistory.isEmpty()) {
+            // Fall back to last inference result
+            if (lastResult != null && lastResult.isValid) {
+                return lastResult;
+            }
+            return new InferenceResult(0f, 0f, 0, false);
+        }
+
+        Float[] values = bpmHistory.toArray(new Float[0]);
+        java.util.Arrays.sort(values);
+        float medianBPM = values[values.length / 2];
+        float confidence = (lastResult != null) ? lastResult.confidence : 0.5f;
+
+        return new InferenceResult(medianBPM, confidence, 0, true);
+    }
+
+    /**
+     * Reset session state (call when starting a new recording).
+     */
+    public void resetSession() {
+        if (bvpHistory != null) bvpHistory.clear();
+        if (bpmHistory != null) bpmHistory.clear();
+        lastBPM = 70.0f;
+        lastBPMTime = 0;
+        lastResult = null;
+        frameCounter = 0;
+        inferenceCounter = 0;
+        Log.i(TAG, "Session reset");
+    }
+
     public void cleanup() {
         if (inferenceExecutor != null) {
             inferenceExecutor.shutdown();

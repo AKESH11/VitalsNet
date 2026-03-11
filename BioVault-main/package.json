@@ -1,27 +1,14 @@
 {
-  "name": "bio-vault-protocol",
-  "version": "1.0.0",
-  "description": "Decentralized Proof of Reality Infrastructure - Physiological Media Anchoring & Multi-Party Consent",
+  "name": "biovault-2",
+  "version": "2.0.0",
+  "description": "BioVault 2.0 — Unified Physiological-Cryptographic Infrastructure for IT Amendment Rules 2026 Compliance",
   "private": true,
   "workspaces": [
-    "mobile-app",
-    "smart-contracts",
-    "zkp-circuits",
-    "backend",
-    "shared"
+    "mobile-app"
   ],
   "scripts": {
-    "install:all": "npm install && npm run install:mobile && npm run install:contracts && npm run install:backend",
     "install:mobile": "cd mobile-app && npm install",
-    "install:contracts": "cd smart-contracts && npm install",
-    "install:backend": "cd backend && npm install",
-    "install:zkp": "cd zkp-circuits && npm install",
     "build:cpp": "cd mobile-app/cpp && cmake -B build && cmake --build build",
-    "build:contracts": "cd smart-contracts && npx hardhat compile",
-    "build:zkp": "cd zkp-circuits && circom circuits/verify.circom --r1cs --wasm --sym",
-    "dev:backend": "cd backend && npm run dev",
-    "test:contracts": "cd smart-contracts && npx hardhat test",
-    "deploy:testnet": "cd smart-contracts && npx hardhat run scripts/deploy.js --network amoy",
     "mobile:android": "cd mobile-app && npm run android",
     "mobile:ios": "cd mobile-app && npm run ios",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
@@ -42,13 +29,16 @@
   },
   "keywords": [
     "biometrics",
-    "blockchain",
-    "deepfake-detection",
     "rppg",
+    "deepfake-detection",
+    "watermarking",
+    "dwt-svd",
+    "hyperledger-besu",
     "zero-knowledge",
-    "decentralized",
-    "proof-of-reality"
+    "it-rules-2026",
+    "compliance",
+    "forensic-analysis"
   ],
-  "author": "Bio-Vault Protocol Team",
+  "author": "BioVault Team",
   "license": "MIT"
 }

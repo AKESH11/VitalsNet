@@ -1,4 +1,4 @@
-// Crypto polyfill — MUST be the very first import (ethers.js needs it)
+// Crypto polyfill — MUST be the very first import (required for secure random generation)
 import 'react-native-get-random-values';
 // react-native-gesture-handler MUST be imported before navigation
 import 'react-native-gesture-handler';

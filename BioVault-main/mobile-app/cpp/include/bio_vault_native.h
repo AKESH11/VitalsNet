@@ -3,6 +3,12 @@
 
 #include <string>
 #include <memory>
+#include <vector>
+#include <cstdint>
+
+#ifdef HAVE_OPENCV
+#include <opencv2/core.hpp>
+#endif
 
 #ifdef ANDROID
 #include <jni.h>
@@ -54,6 +60,28 @@ public:
     std::string calibrateHardware(const std::string& calibrationFramesJson);
 
     /**
+     * @brief Add a single RGBA camera frame for PRNU calibration.
+     * Call at least 50 times, then call finalizeCalibration().
+     * @param rgbaData Raw RGBA pixel data
+     * @param width Frame width in pixels
+     * @param height Frame height in pixels
+     * @return true if frame was accepted
+     */
+    bool addCalibrationFrame(const uint8_t* rgbaData, int width, int height);
+
+    /**
+     * @brief Finalize PRNU calibration after >=50 frames.
+     * @return JSON result with hardwareFingerprint or error
+     */
+    std::string finalizeCalibration();
+
+    /**
+     * @brief Get the PRNU-derived hardware DNA (BLAKE3 hash).
+     * @return 64-char hex string or empty if not calibrated
+     */
+    std::string getHardwareDNA() const;
+
+    /**
      * @brief Generate Bio-Vault hash for blockchain anchoring
      * @param frameData Base64-encoded frame
      * @param bpm Heart rate
@@ -76,6 +104,9 @@ private:
     std::unique_ptr<PRNUExtractor> m_prnuExtractor;
     std::string m_hardwareFingerprint;
     bool m_isInitialized;
+#ifdef HAVE_OPENCV
+    std::vector<cv::Mat> m_calibrationFrames;
+#endif
 };
 
 } // namespace biovault
@@ -86,7 +117,7 @@ private:
 #ifdef ANDROID
 extern "C" {
     JNIEXPORT jstring JNICALL
-    Java_com_biovault_BioVaultModule_initialize(JNIEnv* env, jobject thiz);
+    Java_com_biovault_BioVaultModule_nativeInitialize(JNIEnv* env, jobject thiz);
 
     JNIEXPORT jstring JNICALL
     Java_com_biovault_BioVaultModule_processFrame(
@@ -120,6 +151,31 @@ extern "C" {
     JNIEXPORT jstring JNICALL
     Java_com_biovault_BioVaultModule_finalizeConsensus(
         JNIEnv* env, jobject thiz, jstring sessionId);
+
+    // --- PRNU Calibration (incremental) ---
+    JNIEXPORT jboolean JNICALL
+    Java_com_biovault_BioVaultModule_nativeAddCalibrationFrame(
+        JNIEnv* env, jobject thiz,
+        jbyteArray rgbaData, jint width, jint height);
+
+    JNIEXPORT jstring JNICALL
+    Java_com_biovault_BioVaultModule_nativeFinalizeCalibration(
+        JNIEnv* env, jobject thiz);
+
+    JNIEXPORT jstring JNICALL
+    Java_com_biovault_BioVaultModule_nativeGetHardwareDNA(
+        JNIEnv* env, jobject thiz);
+
+    // --- Watermark (DWT+DCT+SVD) ---
+    JNIEXPORT jbyteArray JNICALL
+    Java_com_biovault_BioVaultModule_nativeEmbedWatermark(
+        JNIEnv* env, jobject thiz,
+        jbyteArray imageRgba, jint w, jint h, jstring payloadJson);
+
+    JNIEXPORT jstring JNICALL
+    Java_com_biovault_BioVaultModule_nativeExtractWatermark(
+        JNIEnv* env, jobject thiz,
+        jbyteArray imageRgba, jint w, jint h);
 }
 #endif
 

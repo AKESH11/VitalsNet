@@ -1,7 +1,0 @@
-node_modules/
-logs/
-temp/
-.env
-dist/
-coverage/
-*.log

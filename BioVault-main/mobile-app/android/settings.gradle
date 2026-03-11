@@ -1,8 +1,11 @@
 rootProject.name = 'TempApp'
 include ':app'
 
-// React Native auto-linking (check multiple locations)
+// React Native auto-linking (check multiple locations — workspace hoisting puts node_modules at repo root)
 def rnCliPath = file("../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
+if (!rnCliPath.exists()) {
+    rnCliPath = file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
+}
 if (!rnCliPath.exists()) {
     rnCliPath = file("../node_modules/react-native/node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
 }
@@ -11,8 +14,11 @@ if (rnCliPath.exists()) {
     applyNativeModulesSettingsGradle(settings)
 }
 
-// React Native Gradle Plugin
+// React Native Gradle Plugin (check hoisted location too)
 def rnGradlePlugin = file("../node_modules/@react-native/gradle-plugin")
+if (!rnGradlePlugin.exists()) {
+    rnGradlePlugin = file("../../node_modules/@react-native/gradle-plugin")
+}
 if (rnGradlePlugin.exists()) {
     includeBuild(rnGradlePlugin)
 }

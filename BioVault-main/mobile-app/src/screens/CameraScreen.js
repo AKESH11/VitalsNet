@@ -1,4 +1,4 @@
-import React, {useState, useEffect, useRef} from 'react';
+import React, {useState, useEffect, useRef, useCallback} from 'react';
 import {
   View,
   Text,
@@ -9,6 +9,8 @@ import {
   Platform,
   NativeModules,
   NativeEventEmitter,
+  Modal,
+  ActivityIndicator,
 } from 'react-native';
 import {BioVaultCameraView} from '../components/BioVaultCameraView';
 import RNFS from 'react-native-fs';
@@ -36,28 +38,64 @@ export default function CameraScreen({navigation}) {
     startTime: null
   });
 
-  // BLE multi-party consent
-  const [consentEnabled, setConsentEnabled] = useState(false);
+  // BLE consent is always active — no toggle needed
   const [consentResult, setConsentResult] = useState(null);
   const consentResultRef = useRef(null);
 
+  // Consent overlay (shown when content is SENSITIVE/EXPLICIT — IN REAL TIME during recording)
+  const [showConsentOverlay, setShowConsentOverlay] = useState(false);
+  const [consentCountdown, setConsentCountdown] = useState(15);
+  const [consentStatus, setConsentStatus] = useState('waiting'); // waiting | approved | denied | timeout
+  const [bleSessionActive, setBleSessionActive] = useState(false);
+  const pendingNavigationRef = useRef(null); // holds nav params while consent is pending
+
+  // Refs that mirror state — used inside setInterval closures to avoid stale captures
+  const consentOverlayRef = useRef(false);
+  const bleSessionRef = useRef(false);
+  const consentTriggeredRef = useRef(false); // true once consent session started for this recording
+
+  // Live content classification during recording
+  const [liveCategory, setLiveCategory] = useState(null); // null | SAFE | SENSITIVE | EXPLICIT
+  const [liveLabel, setLiveLabel] = useState('');
+  const [liveConfidence, setLiveConfidence] = useState(0);
+  const consentApprovedRef = useRef(false); // true once BLE approval received
+
+  // Incoming consent request from ANOTHER device (we are the bystander)
+  const [incomingConsentRequest, setIncomingConsentRequest] = useState(null);
+  const respondedAddressesRef = useRef(new Set()); // addresses we already responded to
+
   useEffect(() => {
-    let sub;
+    let approvalSub, requestSub;
     try {
       if (BioVaultModule) {
         const emitter = new NativeEventEmitter(NativeModules.BioVaultModule);
-        sub = emitter.addListener('onConsensusUpdate', (event) => {
+
+        // EVENT 1: We are the RECORDER — a nearby device approved/denied/timed out
+        approvalSub = emitter.addListener('onConsentApprovalReceived', (event) => {
+          console.log('[BioVault] Consent response received:', JSON.stringify(event));
           setConsentResult(event);
           consentResultRef.current = event;
-          if (event.complete) {
-            Alert.alert('Consent', `Multi-party consent received (${event.signaturesReceived} sigs).`);
-          } else if (event.timeout) {
-            Alert.alert('Consent Timeout', `Received ${event.receivedCount}/${event.expectedCount} consent signatures.`);
-          }
         });
+
+        // EVENT 2: We are the BYSTANDER — a nearby device is requesting consent
+        requestSub = emitter.addListener('onConsentRequestReceived', (event) => {
+          console.log('[BioVault] Incoming consent request:', JSON.stringify(event));
+          // Don't show popup if we already responded to this device
+          if (event?.deviceAddress && respondedAddressesRef.current.has(event.deviceAddress)) {
+            console.log('[BioVault] Ignoring repeat request from', event.deviceAddress);
+            return;
+          }
+          setIncomingConsentRequest(event);
+        });
+
+        // Passive scanning is started after permissions are granted (see requestCameraPermission)
       }
     } catch (_) {}
-    return () => { if (sub) sub.remove(); };
+    return () => {
+      if (approvalSub) approvalSub.remove();
+      if (requestSub) requestSub.remove();
+      try { BioVaultModule?.stopPassiveConsentScan?.(); } catch (_) {}
+    };
   }, []);
 
   useEffect(() => {
@@ -80,6 +118,86 @@ export default function CameraScreen({navigation}) {
     return () => clearInterval(timer);
   }, [isRecording]);
 
+  // ── Periodic content classification during recording (every 5s) ──
+  useEffect(() => {
+    if (!isRecording) {
+      setLiveCategory(null);
+      setLiveLabel('');
+      setLiveConfidence(0);
+      consentApprovedRef.current = false;
+      consentTriggeredRef.current = false;
+      return;
+    }
+    let cancelled = false;
+    const classifyInterval = setInterval(async () => {
+      if (cancelled || !BioVaultModule?.classifyCurrentFrame) return;
+      // Use REFS (not state) to avoid stale closure captures
+      if (consentTriggeredRef.current || consentOverlayRef.current || bleSessionRef.current) return;
+      try {
+        const resultStr = await BioVaultModule.classifyCurrentFrame();
+        if (cancelled) return;
+        const result = JSON.parse(resultStr);
+        setLiveCategory(result.category);
+        setLiveLabel(result.label);
+        setLiveConfidence(result.confidence);
+        console.log('[BioVault] Live classify:', result.category, result.label, result.confidence + '%');
+
+        // If flagged and consent not yet given, trigger consent ONCE per recording
+        if (result.requiresConsent && !consentApprovedRef.current && !consentTriggeredRef.current) {
+          consentTriggeredRef.current = true; // lock — never re-trigger
+          setConsentCountdown(20);
+          setConsentStatus('waiting');
+          setShowConsentOverlay(true);
+          consentOverlayRef.current = true;
+          // Broadcast consent request via BLE
+          try {
+            const sid = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+            await BioVaultModule.startBLEConsentSession(sid, result.category || 'SENSITIVE');
+            setBleSessionActive(true);
+            bleSessionRef.current = true;
+          } catch (_) {
+            setBleSessionActive(false);
+          }
+        }
+      } catch (err) {
+        console.warn('[BioVault] Live classify error:', err.message);
+      }
+    }, 5000); // classify every 5 seconds
+
+    // Also run once after 3 seconds for early detection
+    const earlyTimer = setTimeout(async () => {
+      if (cancelled || !BioVaultModule?.classifyCurrentFrame) return;
+      if (consentTriggeredRef.current || consentOverlayRef.current || bleSessionRef.current) return;
+      try {
+        const resultStr = await BioVaultModule.classifyCurrentFrame();
+        if (cancelled) return;
+        const result = JSON.parse(resultStr);
+        setLiveCategory(result.category);
+        setLiveLabel(result.label);
+        setLiveConfidence(result.confidence);
+        if (result.requiresConsent && !consentApprovedRef.current && !consentTriggeredRef.current) {
+          consentTriggeredRef.current = true;
+          setConsentCountdown(20);
+          setConsentStatus('waiting');
+          setShowConsentOverlay(true);
+          consentOverlayRef.current = true;
+          try {
+            const sid = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+            await BioVaultModule.startBLEConsentSession(sid, result.category || 'SENSITIVE');
+            setBleSessionActive(true);
+            bleSessionRef.current = true;
+          } catch (_) { setBleSessionActive(false); }
+        }
+      } catch (_) {}
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(classifyInterval);
+      clearTimeout(earlyTimer);
+    };
+  }, [isRecording]);
+
   const requestCameraPermission = async () => {
     if (Platform.OS === 'android') {
       try {
@@ -92,6 +210,32 @@ export default function CameraScreen({navigation}) {
           }
         );
         setHasPermission(granted === PermissionsAndroid.RESULTS.GRANTED);
+
+        // Request BLE + Location permissions for consent flow
+        try {
+          const btPerms = [
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+            PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+          ].filter(Boolean); // filter undefined on older APIs
+          if (btPerms.length > 0) {
+            await PermissionsAndroid.requestMultiple(btPerms);
+          }
+        } catch (btErr) {
+          console.warn('[BioVault] BT permission request failed (non-fatal):', btErr.message);
+        }
+
+        // Now that permissions are granted, start passive BLE scanning
+        // so this device can receive consent requests from nearby recorders
+        try {
+          if (BioVaultModule?.startPassiveConsentScan) {
+            await BioVaultModule.startPassiveConsentScan();
+            console.log('[BioVault] Passive consent scanning started');
+          }
+        } catch (passiveErr) {
+          console.warn('[BioVault] Passive scan start failed:', passiveErr.message);
+        }
       } catch (err) {
         console.warn(err);
         setHasPermission(false);
@@ -179,16 +323,8 @@ export default function CameraScreen({navigation}) {
       
       recordingDataRef.current.fallbackTimerId = fallbackTimerId;
 
-      // If BLE consent is enabled, start a consensus session
-      if (consentEnabled && facesDetected > 1) {
-        try {
-          const sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-          await BioVaultModule.startConsensusSession(sessionId, facesDetected, bpm || 0);
-          console.log('[BioVault] BLE consensus session started:', sessionId);
-        } catch (bleErr) {
-          console.warn('[BioVault] BLE consent start failed:', bleErr.message);
-        }
-      }
+      // BLE consent request is NOT started here — it's started dynamically
+      // when the periodic content classifier detects SENSITIVE/EXPLICIT content.
       
     } catch (error) {
       console.error('[BioVault] Error starting recording:', error);
@@ -198,6 +334,7 @@ export default function CameraScreen({navigation}) {
   };
 
   const stopRecording = async () => {
+   try {
     setIsRecording(false);
     
     // Clear fallback timer if it exists
@@ -210,11 +347,17 @@ export default function CameraScreen({navigation}) {
       clearInterval(recordingDataRef.current.intervalId);
     }
     
-    // Stop rPPG session
+    // Stop rPPG session — returns real BPM, content hash, hardware DNA
+    let rppgResult = null;
     try {
       if (BioVaultModule && BioVaultModule.stopRPPGExtraction) {
-        const result = await BioVaultModule.stopRPPGExtraction();
-        console.log('[BioVault] rPPG extraction stopped:', result);
+        const resultStr = await BioVaultModule.stopRPPGExtraction();
+        console.log('[BioVault] rPPG extraction stopped:', resultStr);
+        try {
+          rppgResult = typeof resultStr === 'string' ? JSON.parse(resultStr) : resultStr;
+        } catch (_) {
+          rppgResult = null;
+        }
       }
     } catch (error) {
       console.error('[BioVault] Failed to stop rPPG:', error);
@@ -223,8 +366,8 @@ export default function CameraScreen({navigation}) {
 
     // Stop BLE consensus session
     try {
-      if (BioVaultModule && BioVaultModule.stopConsensusSession) {
-        await BioVaultModule.stopConsensusSession();
+      if (BioVaultModule && BioVaultModule.stopBLEConsentSession) {
+        await BioVaultModule.stopBLEConsentSession();
       }
     } catch (_bleErr) {}
     
@@ -245,122 +388,319 @@ export default function CameraScreen({navigation}) {
     const variance = bpmReadings.reduce((sum, val) => sum + Math.pow(val - avgBpm, 2), 0) / bpmReadings.length;
     const stdDev = Math.sqrt(variance);
     const finalConfidence = Math.max(0, Math.min(100, 100 - (stdDev * 2)));
-    
-    Alert.alert(
-      'Bio-Signature Extracted',
-      `Recording complete!\n\nAverage BPM: ${Math.round(avgBpm)}\nConfidence: ${Math.round(finalConfidence)}%`,
-      [
-        {
+
+    // Build navigation params (shared between consent / no-consent paths)
+    const buildNavParams = async (consentData) => {
+      let videoHash = rppgResult?.videoHash || '';
+      let bioSignature = rppgResult?.bioSignature || '';
+      let hardwareDNA = rppgResult?.hardwareDNA || '';
+      let proofOfRealityHash = '';
+
+      try {
+        if (BioVaultModule && BioVaultModule.generateProofOfReality) {
+          const proofResult = await BioVaultModule.generateProofOfReality(Math.round(avgBpm));
+          proofOfRealityHash = proofResult?.proofOfRealityHash || '';
+          if (!videoHash) videoHash = proofResult?.videoHash || '';
+          if (!hardwareDNA) hardwareDNA = proofResult?.hardwareID || '';
+        }
+      } catch (nativeError) {
+        console.warn('Native proof-of-reality failed:', nativeError.message);
+      }
+
+      let hardwareFingerprint = hardwareDNA;
+      if (!hardwareFingerprint) {
+        try {
+          if (BioVaultModule && BioVaultModule.getHardwareFingerprint) {
+            hardwareFingerprint = await BioVaultModule.getHardwareFingerprint();
+            hardwareDNA = hardwareFingerprint;
+          }
+        } catch (_) {}
+      }
+
+      console.log('[BioVault] Proof data — videoHash:', videoHash?.substring(0, 18) + '...',
+        'BPM:', rppgResult?.averageBPM, 'frames:', rppgResult?.frameCount,
+        'DNA:', hardwareDNA?.substring(0, 16) + '...');
+
+      // Embed watermark
+      let watermarkedImageBase64 = '';
+      try {
+        if (BioVaultModule && BioVaultModule.captureLastFrame && BioVaultModule.embedWatermark) {
+          const frameBase64 = await BioVaultModule.captureLastFrame();
+          if (frameBase64) {
+            const wmPayload = JSON.stringify({
+              id: Date.now().toString(36).slice(-6),
+              dna: (hardwareDNA || '').substring(0, 8),
+              ts: Math.floor(Date.now() / 1000),
+              bpm: Math.round(avgBpm),
+            });
+            watermarkedImageBase64 = await BioVaultModule.embedWatermark(frameBase64, wmPayload);
+            console.log('[BioVault] Watermark embedded:', wmPayload, 'imgLen:', watermarkedImageBase64?.length);
+          }
+        }
+      } catch (wmErr) {
+        console.warn('[BioVault] Watermark embed failed:', wmErr.message);
+      }
+
+      // Save recording
+      let mediaFilePath = '';
+      try {
+        await RNFS.mkdir(MEDIA_DIR);
+        const recordingId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        const recordingData = {
+          id: recordingId,
+          timestamp: Date.now(),
+          bpm: Math.round(avgBpm),
+          confidence: Math.round(finalConfidence),
+          duration,
+          facesDetected,
+          framesProcessed: frames.length,
+          statistics: {
+            min: Math.round(minBpm),
+            max: Math.round(maxBpm),
+            stdDev: parseFloat(stdDev.toFixed(2)),
+            readings: bpmReadings.length,
+          },
+          proofOfReality: {
+            videoHash,
+            bioSignature,
+            hardwareDNA,
+            proofOfRealityHash,
+          },
+        };
+        mediaFilePath = MEDIA_DIR + '/' + recordingId + '.json';
+        await RNFS.writeFile(mediaFilePath, JSON.stringify(recordingData, null, 2), 'utf8');
+      } catch (fsError) {
+        console.warn('[BioVault] Failed to save recording file:', fsError.message);
+      }
+
+      return {
+        bpm: Math.round(avgBpm),
+        confidence: Math.round(finalConfidence),
+        duration,
+        facesDetected,
+        framesProcessed: frames.length,
+        statistics: {
+          min: Math.round(minBpm),
+          max: Math.round(maxBpm),
+          stdDev: stdDev.toFixed(2),
+        },
+        videoHash,
+        bioSignature,
+        hardwareDNA,
+        hardwareFingerprint,
+        proofOfRealityHash,
+        mediaFilePath,
+        watermarkedImageBase64,
+        contentCategory: rppgResult?.contentCategory || 'SAFE',
+        requiresConsent: rppgResult?.requiresConsent || false,
+        contentLabel: rppgResult?.contentLabel || '',
+        contentConfidence: rppgResult?.contentConfidence || 0,
+        consentParties: consentData || consentResultRef.current
+          ? {
+              consensusHash: (consentData || consentResultRef.current)?.consensusHash || '',
+              signaturesReceived: (consentData || consentResultRef.current)?.signaturesReceived || 0,
+              consentMethod: consentData?.consentMethod || 'ble',
+              consentTimestamp: consentData?.consentTimestamp || Date.now(),
+            }
+          : null,
+      };
+    };
+
+    const contentCategory = rppgResult?.contentCategory || liveCategory || 'SAFE';
+    const needsConsent = (rppgResult?.requiresConsent || false) || (liveCategory === 'SENSITIVE' || liveCategory === 'EXPLICIT');
+
+    // If consent was already approved mid-recording via BLE, proceed directly
+    if (consentApprovedRef.current && consentResultRef.current?.approved) {
+      const consentData = consentResultRef.current;
+      try {
+        const navParams = await buildNavParams(consentData);
+        // Override category with live classification if rPPG didn't flag it
+        if (liveCategory && liveCategory !== 'SAFE') {
+          navParams.contentCategory = liveCategory;
+          navParams.requiresConsent = true;
+          navParams.contentLabel = liveLabel || navParams.contentLabel;
+          navParams.contentConfidence = liveConfidence || navParams.contentConfidence;
+        }
+        navigation.navigate('Results', navParams);
+      } catch (navErr) {
+        console.error('[BioVault] Navigation error:', navErr);
+        Alert.alert('Error', 'Failed to load results.');
+      }
+      return;
+    }
+
+    if (needsConsent) {
+      // Content is SENSITIVE or EXPLICIT — show consent overlay and wait for BLE approval
+      try {
+        setIsProcessing(true);
+        const navParams = await buildNavParams(null);
+        setIsProcessing(false);
+        pendingNavigationRef.current = navParams;
+        setConsentCountdown(20);
+        setConsentStatus('waiting');
+        setShowConsentOverlay(true);
+        consentOverlayRef.current = true;
+
+        // Broadcast consent request via BLE — nearby devices will see this
+        try {
+          const sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+          await BioVaultModule.startBLEConsentSession(sessionId, contentCategory);
+          setBleSessionActive(true);
+          bleSessionRef.current = true;
+          console.log('[BioVault] Consent BLE request broadcast:', sessionId);
+        } catch (bleErr) {
+          console.warn('[BioVault] BLE consent broadcast failed:', bleErr.message);
+          setBleSessionActive(false);
+        }
+      } catch (consentErr) {
+        console.error('[BioVault] Consent flow error:', consentErr);
+        setIsProcessing(false);
+        setShowConsentOverlay(false);
+        consentOverlayRef.current = false;
+        // No fallback — consent is mandatory. Alert user.
+        Alert.alert(
+          'Consent Required',
+          'Could not initiate consent flow. The recording cannot be saved without consent from nearby parties.',
+          [{text: 'OK'}]
+        );
+      }
+    } else {
+      // SAFE content — proceed normally
+      Alert.alert(
+        'Bio-Signature Extracted',
+        `Recording complete!\n\nAverage BPM: ${Math.round(avgBpm)}\nConfidence: ${Math.round(finalConfidence)}%`,
+        [{
           text: 'View Results',
           onPress: async () => {
-            // Gather proof-of-reality data from native module
-            let videoHash = '';
-            let bioSignature = '';
-            let hardwareDNA = '';
-            let proofOfRealityHash = '';
-
             try {
-              if (BioVaultModule) {
-                // Get bio-vault hash (BLAKE3 of frame data + BPM + hardware ID + timestamp)
-                if (BioVaultModule.generateProofOfReality) {
-                  const proofResult = await BioVaultModule.generateProofOfReality(Math.round(avgBpm));
-                  videoHash = proofResult?.videoHash || '';
-                  bioSignature = proofResult?.bioSignature || '';
-                  hardwareDNA = proofResult?.hardwareID || '';
-                  proofOfRealityHash = proofResult?.proofOfRealityHash || '';
-                } else {
-                  // Fallback: use individual methods if available
-                  if (BioVaultModule.getHardwareFingerprint) {
-                    hardwareDNA = await BioVaultModule.getHardwareFingerprint();
-                  }
-                  if (BioVaultModule.getBioSignature) {
-                    bioSignature = await BioVaultModule.getBioSignature(Math.round(avgBpm));
-                  }
-                }
-              }
-            } catch (nativeError) {
-              console.warn('Native proof-of-reality failed:', nativeError.message);
-              // Continue with whatever data we have
+              const navParams = await buildNavParams(null);
+              navigation.navigate('Results', navParams);
+            } catch (navErr) {
+              console.error('[BioVault] Navigation error:', navErr);
+              Alert.alert('Error', 'Failed to load results.');
             }
-
-            // Extract PRNU hardware fingerprint before navigating to Results
-            let hardwareFingerprint = '';
-            try {
-              if (BioVaultModule && BioVaultModule.extractPRNU) {
-                const prnuResult = await BioVaultModule.extractPRNU();
-                hardwareFingerprint = prnuResult?.fingerprint || prnuResult || '';
-                console.log('[BioVault] PRNU fingerprint extracted:', hardwareFingerprint ? 'success' : 'empty');
-              }
-            } catch (prnuError) {
-              console.warn('[BioVault] PRNU extraction failed:', prnuError.message);
-            }
-            // Use PRNU fingerprint as hardwareDNA if we didn't get one from generateProofOfReality
-            if (hardwareFingerprint && !hardwareDNA) {
-              hardwareDNA = hardwareFingerprint;
-            }
-
-            // Save recording data to disk via RNFS
-            let mediaFilePath = '';
-            try {
-              await RNFS.mkdir(MEDIA_DIR);
-              const recordingId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-              const recordingData = {
-                id: recordingId,
-                timestamp: Date.now(),
-                bpm: Math.round(avgBpm),
-                confidence: Math.round(finalConfidence),
-                duration,
-                facesDetected,
-                framesProcessed: frames.length,
-                statistics: {
-                  min: Math.round(minBpm),
-                  max: Math.round(maxBpm),
-                  stdDev: parseFloat(stdDev.toFixed(2)),
-                  readings: bpmReadings.length,
-                },
-                proofOfReality: {
-                  videoHash,
-                  bioSignature,
-                  hardwareDNA,
-                  proofOfRealityHash,
-                },
-              };
-              mediaFilePath = MEDIA_DIR + '/' + recordingId + '.json';
-              await RNFS.writeFile(mediaFilePath, JSON.stringify(recordingData, null, 2), 'utf8');
-              console.log('[BioVault] Recording saved to:', mediaFilePath);
-            } catch (fsError) {
-              console.warn('[BioVault] Failed to save recording file:', fsError.message);
-              // Non-fatal — continue to Results without file path
-            }
-
-            navigation.navigate('Results', {
-              bpm: Math.round(avgBpm),
-              confidence: Math.round(finalConfidence),
-              duration,
-              facesDetected,
-              framesProcessed: frames.length,
-              statistics: {
-                min: Math.round(minBpm),
-                max: Math.round(maxBpm),
-                stdDev: stdDev.toFixed(2),
-              },
-              videoHash,
-              bioSignature,
-              hardwareDNA,
-              hardwareFingerprint,
-              proofOfRealityHash,
-              mediaFilePath,
-              consentParties: consentResultRef.current
-                ? {
-                    consensusHash: consentResultRef.current.consensusHash || '',
-                    signaturesReceived: consentResultRef.current.signaturesReceived || 0,
-                  }
-                : null,
-            });
           },
-        },
-      ]
-    );
+        }]
+      );
+    }
+   } catch (fatalErr) {
+    console.error('[BioVault] stopRecording fatal error:', fatalErr);
+    setIsRecording(false);
+    setIsProcessing(false);
+    setShowConsentOverlay(false);
+    consentOverlayRef.current = false;
+    Alert.alert('Error', 'An error occurred while processing. Please try again.');
+   }
+  };
+
+  // Consent overlay countdown timer
+  useEffect(() => {
+    if (!showConsentOverlay || consentStatus !== 'waiting') return;
+    if (consentCountdown <= 0) {
+      // Timeout — no BLE approval received. Auto-deny and delete capture.
+      setConsentStatus('timeout');
+      pendingNavigationRef.current = null;
+      // Stop recording if still active
+      if (isRecording) {
+        setIsRecording(false);
+        try { BioVaultModule?.stopRPPGExtraction?.(); } catch (_) {}
+      }
+      try { BioVaultModule?.stopBLEConsentSession?.(); } catch (_) {}
+      setBleSessionActive(false);
+      bleSessionRef.current = false;
+      // Alert user after a brief delay
+      setTimeout(() => {
+        setShowConsentOverlay(false);
+        consentOverlayRef.current = false;
+        Alert.alert(
+          'No Consent Received',
+          'No nearby BioVault device approved this recording within the time limit.\n\nThe capture has been discarded. Sensitive/explicit content requires real consent from all parties.',
+          [{text: 'OK'}]
+        );
+      }, 1500);
+      return;
+    }
+    const timer = setTimeout(() => setConsentCountdown(c => c - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [showConsentOverlay, consentCountdown, consentStatus]);
+
+  // Handle BLE consent approval received from nearby device
+  useEffect(() => {
+    if (showConsentOverlay && consentResult?.approved === true && consentStatus === 'waiting') {
+      handleBLEApproval();
+    }
+    // If nearby device explicitly denied
+    if (showConsentOverlay && consentResult?.approved === false && consentStatus === 'waiting') {
+      handleConsentDeny();
+    }
+    // If the consent request timed out on the native side
+    if (showConsentOverlay && consentResult?.timeout === true && consentStatus === 'waiting') {
+      // Let the JS countdown handle the timeout UI
+    }
+  }, [consentResult, showConsentOverlay, consentStatus]);
+
+  const handleBLEApproval = () => {
+    setConsentStatus('approved');
+    consentApprovedRef.current = true;
+    try { BioVaultModule?.stopBLEConsentSession?.(); } catch (_) {}
+    setBleSessionActive(false);
+    bleSessionRef.current = false;
+
+    const consentData = {
+      approved: true,
+      deviceAddress: consentResultRef.current?.deviceAddress || 'ble-device',
+      sessionId: consentResultRef.current?.sessionId || '',
+      consentMethod: 'ble',
+      consentTimestamp: Date.now(),
+    };
+
+    // If recording is still active, just dismiss overlay — recording continues
+    if (isRecording) {
+      consentResultRef.current = consentData;
+      setTimeout(() => {
+        setShowConsentOverlay(false);
+        consentOverlayRef.current = false;
+      }, 800);
+      return;
+    }
+
+    // If recording already stopped (consent shown post-stop), navigate to Results
+    setTimeout(() => {
+      setShowConsentOverlay(false);
+      consentOverlayRef.current = false;
+      const navParams = pendingNavigationRef.current;
+      if (navParams) {
+        navParams.consentParties = consentData;
+        navigation.navigate('Results', navParams);
+        pendingNavigationRef.current = null;
+      }
+    }, 800);
+  };
+
+  const handleConsentDeny = () => {
+    setConsentStatus('denied');
+    try { BioVaultModule?.stopBLEConsentSession?.(); } catch (_) {}
+    setBleSessionActive(false);
+    bleSessionRef.current = false;
+    pendingNavigationRef.current = null;
+
+    // If recording is still active, stop it
+    if (isRecording) {
+      setIsRecording(false);
+      try {
+        if (BioVaultModule?.stopRPPGExtraction) BioVaultModule.stopRPPGExtraction();
+      } catch (_) {}
+    }
+
+    setTimeout(() => {
+      setShowConsentOverlay(false);
+      consentOverlayRef.current = false;
+      Alert.alert(
+        'Capture Deleted',
+        'The recorded media has been discarded because consent was denied.\n\nBioVault requires approval for sensitive/explicit content.',
+        [{text: 'OK'}]
+      );
+    }, 500);
   };
 
   if (!hasPermission) {
@@ -428,8 +768,6 @@ export default function CameraScreen({navigation}) {
   // NOTE: Simulated heart rate fallback was removed for production.
   // All BPM data must come from the real TS-CAN neural rPPG engine
   // to maintain the "Proof of Reality" guarantee.
-
-  console.log('[BioVault] Rendering CameraScreen, hasPermission:', hasPermission);
 
   return (
     <View style={styles.container}>
@@ -516,59 +854,73 @@ export default function CameraScreen({navigation}) {
         </View>
 
         <View style={styles.centerArea}>
-          {/* Minimal center guidance - no fixed frame */}
+          {/* Minimal center — only initial guidance when no face and not recording */}
           {!isRecording && facesDetected === 0 && (
             <View style={styles.guidanceContainer}>
               <Text style={styles.guidanceIcon}>📸</Text>
-              <Text style={styles.guidanceText}>Show your face to camera</Text>
-              <Text style={styles.guidanceSubtext}>Rectangle will appear when detected</Text>
-            </View>
-          )}
-          
-          {/* Status messages */}
-          {facesDetected > 0 && !isRecording && (
-            <View style={styles.readyContainer}>
-              <Text style={styles.readyIcon}>✓</Text>
-              <Text style={styles.readyText}>Ready to record</Text>
-            </View>
-          )}
-          
-          {/* Quality indicators during recording */}
-          {isRecording && facesDetected === 0 && (
-            <View style={styles.warningContainer}>
-              <Text style={styles.warningIcon}>⚠️</Text>
-              <Text style={styles.warningText}>No face detected - move closer</Text>
-            </View>
-          )}
-          
-          {isRecording && confidence < 50 && facesDetected > 0 && (
-            <View style={styles.warningContainer}>
-              <Text style={styles.warningIcon}>💡</Text>
-              <Text style={styles.warningText}>Stay still - improving signal quality...</Text>
-            </View>
-          )}
-
-          {/* Removed large center BPM - now in top-right corner */}
-
-          {/* Timer */}
-          {isRecording && (
-            <View style={styles.timerContainer}>
-              <Text style={styles.timerIcon}>⏱️</Text>
-              <Text style={styles.timerText}>{duration}s / 30s</Text>
+              <Text style={styles.guidanceText}>Position your face in frame</Text>
+              <Text style={styles.guidanceSubtext}>A tracking rectangle will appear</Text>
             </View>
           )}
         </View>
 
         <View style={styles.bottomBar}>
-          {/* BLE Consent Toggle */}
+          {/* ── Status Strip: compact contextual info ── */}
+          {isRecording && (
+            <View style={styles.statusStrip}>
+              <View style={styles.statusChip}>
+                <Text style={styles.statusChipText}>⏱ {duration}s / 30s</Text>
+              </View>
+
+              {facesDetected === 0 && (
+                <View style={[styles.statusChip, styles.statusChipWarn]}>
+                  <Text style={styles.statusChipText}>⚠ No face</Text>
+                </View>
+              )}
+
+              {confidence < 50 && facesDetected > 0 && (
+                <View style={[styles.statusChip, styles.statusChipCaution]}>
+                  <Text style={styles.statusChipText}>💡 Stay still</Text>
+                </View>
+              )}
+
+              {confidence >= 50 && facesDetected > 0 && (
+                <View style={[styles.statusChip, styles.statusChipGood]}>
+                  <Text style={styles.statusChipText}>✓ Good signal</Text>
+                </View>
+              )}
+
+              {/* Live content classification badge */}
+              {liveCategory && liveCategory !== 'SAFE' && (
+                <View style={[styles.statusChip,
+                  liveCategory === 'EXPLICIT' ? styles.statusChipExplicit : styles.statusChipSensitive]}>
+                  <Text style={styles.statusChipText}>
+                    {liveCategory === 'EXPLICIT' ? '🔴' : '🟡'} {liveCategory}
+                  </Text>
+                </View>
+              )}
+
+              {consentApprovedRef.current && (
+                <View style={[styles.statusChip, styles.statusChipGood]}>
+                  <Text style={styles.statusChipText}>✓ Consent</Text>
+                </View>
+              )}
+            </View>
+          )}
+
+          {/* Ready pill when face detected + not recording */}
+          {!isRecording && facesDetected > 0 && (
+            <View style={styles.readyPill}>
+              <Text style={styles.readyPillText}>✓ Face detected — ready to record</Text>
+            </View>
+          )}
+          {/* BLE Consent is always active — no toggle needed */}
           {!isRecording && (
-            <TouchableOpacity
-              style={[styles.consentToggle, consentEnabled && styles.consentToggleActive]}
-              onPress={() => setConsentEnabled(!consentEnabled)}>
+            <View style={[styles.consentToggle, styles.consentToggleActive]}>
               <Text style={styles.consentToggleText}>
-                {consentEnabled ? '🤝 Multi-Party Consent ON' : '👤 Single-Party Mode'}
+                🛡️ BLE Consent Active
               </Text>
-            </TouchableOpacity>
+            </View>
           )}
 
           <View style={styles.controlsContainer}>
@@ -600,6 +952,174 @@ export default function CameraScreen({navigation}) {
           )}
         </View>
       </View>
+
+      {/* ═══ Consent Overlay Modal (RECORDER side — waiting for nearby approval) ═══ */}
+      <Modal
+        visible={showConsentOverlay}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => {}}>
+        <View style={styles.consentOverlay}>
+          <View style={styles.consentCard}>
+            {consentStatus === 'waiting' && (
+              <>
+                {/* Category badge */}
+                <View style={[
+                  styles.consentBadge,
+                  (pendingNavigationRef.current?.contentCategory || liveCategory) === 'EXPLICIT'
+                    ? styles.consentBadgeExplicit
+                    : styles.consentBadgeSensitive
+                ]}>
+                  <Text style={styles.consentBadgeText}>
+                    {(pendingNavigationRef.current?.contentCategory || liveCategory) === 'EXPLICIT'
+                      ? '🔴 EXPLICIT'
+                      : '🟡 SENSITIVE'}
+                  </Text>
+                </View>
+
+                <Text style={styles.consentTitle}>⏳ Waiting for Consent</Text>
+                <Text style={styles.consentDesc}>
+                  {((pendingNavigationRef.current?.contentCategory || liveCategory) === 'EXPLICIT'
+                    ? 'Explicit content detected'
+                    : 'Sensitive content detected')
+                  + ` — ${pendingNavigationRef.current?.contentLabel || liveLabel || 'flagged'}`
+                  + ` (${liveConfidence || Math.round((pendingNavigationRef.current?.contentConfidence || 0) * 100)}%)`}
+                  {'\n\n'}Broadcasting consent request via BLE.
+                  {'\n'}A nearby BioVault device must approve before this capture can be stored.
+                  {isRecording ? '\n\n📹 Recording is still active.' : ''}
+                </Text>
+
+                {/* Countdown */}
+                <View style={styles.consentCountdownRing}>
+                  <Text style={styles.consentCountdownValue}>{consentCountdown}</Text>
+                  <Text style={styles.consentCountdownUnit}>seconds left</Text>
+                </View>
+
+                <View style={styles.consentBleRow}>
+                  <ActivityIndicator size="small" color="#6366f1" />
+                  <Text style={styles.consentBleText}>
+                    {bleSessionActive
+                      ? 'Broadcasting consent request to nearby devices…'
+                      : 'Initializing BLE broadcast…'}
+                  </Text>
+                </View>
+
+                <View style={styles.consentButtons}>
+                  <TouchableOpacity
+                    style={styles.consentDenyBtn}
+                    activeOpacity={0.7}
+                    onPress={handleConsentDeny}>
+                    <Text style={styles.consentDenyBtnText}>✕  Cancel & Delete Recording</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
+
+            {consentStatus === 'approved' && (
+              <View style={styles.consentResult}>
+                <Text style={styles.consentResultIcon}>✅</Text>
+                <Text style={styles.consentResultText}>Consent Granted via BLE</Text>
+                <Text style={styles.consentResultSub}>
+                  Approved by nearby device{consentResultRef.current?.deviceAddress
+                    ? ` (${consentResultRef.current.deviceAddress.slice(-5)})`
+                    : ''}
+                </Text>
+              </View>
+            )}
+
+            {consentStatus === 'denied' && (
+              <View style={styles.consentResult}>
+                <Text style={styles.consentResultIcon}>❌</Text>
+                <Text style={styles.consentResultText}>Consent Denied</Text>
+                <Text style={styles.consentResultSub}>Capture has been deleted</Text>
+              </View>
+            )}
+
+            {consentStatus === 'timeout' && (
+              <View style={styles.consentResult}>
+                <Text style={styles.consentResultIcon}>⏰</Text>
+                <Text style={styles.consentResultText}>No Consent Received</Text>
+                <Text style={styles.consentResultSub}>
+                  No nearby device approved — capture discarded.
+                </Text>
+              </View>
+            )}
+          </View>
+        </View>
+      </Modal>
+
+      {/* ═══ Incoming Consent Request Modal (BYSTANDER side — another device is asking us) ═══ */}
+      <Modal
+        visible={!!incomingConsentRequest}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setIncomingConsentRequest(null)}>
+        <View style={styles.consentOverlay}>
+          <View style={styles.consentCard}>
+            <View style={[
+              styles.consentBadge,
+              incomingConsentRequest?.category === 'EXPLICIT'
+                ? styles.consentBadgeExplicit
+                : styles.consentBadgeSensitive
+            ]}>
+              <Text style={styles.consentBadgeText}>
+                {incomingConsentRequest?.category === 'EXPLICIT'
+                  ? '🔴 EXPLICIT'
+                  : '🟡 SENSITIVE'}
+              </Text>
+            </View>
+
+            <Text style={styles.consentTitle}>📱 Consent Requested</Text>
+            <Text style={styles.consentDesc}>
+              A nearby device is recording {incomingConsentRequest?.category === 'EXPLICIT'
+                ? 'explicit' : 'sensitive'} content.
+              {'\n\n'}They need your approval to save this recording.
+              You may be in the frame.
+              {'\n\n'}Do you consent to this recording?
+            </Text>
+
+            <View style={styles.consentButtons}>
+              <TouchableOpacity
+                style={styles.consentApproveBtn}
+                activeOpacity={0.7}
+                onPress={async () => {
+                  const addr = incomingConsentRequest?.deviceAddress;
+                  const sid = incomingConsentRequest?.sessionId;
+                  setIncomingConsentRequest(null);
+                  if (addr) respondedAddressesRef.current.add(addr);
+                  if (sid && BioVaultModule?.respondToConsentRequest) {
+                    try {
+                      await BioVaultModule.respondToConsentRequest(sid, true);
+                      Alert.alert('Consent Sent', 'You approved the recording.');
+                    } catch (e) {
+                      Alert.alert('Error', 'Failed to send approval: ' + e.message);
+                    }
+                  }
+                }}>
+                <Text style={styles.consentApproveBtnText}>✓  I Consent</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.consentDenyBtn}
+                activeOpacity={0.7}
+                onPress={async () => {
+                  const addr = incomingConsentRequest?.deviceAddress;
+                  const sid = incomingConsentRequest?.sessionId;
+                  setIncomingConsentRequest(null);
+                  if (addr) respondedAddressesRef.current.add(addr);
+                  if (sid && BioVaultModule?.respondToConsentRequest) {
+                    try {
+                      await BioVaultModule.respondToConsentRequest(sid, false);
+                      Alert.alert('Denied', 'You denied the recording.');
+                    } catch (_) {}
+                  }
+                }}>
+                <Text style={styles.consentDenyBtnText}>✕  I Do Not Consent</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -822,59 +1342,72 @@ const styles = StyleSheet.create({
   },
   guidanceContainer: {
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.7)',
-    padding: 24,
-    borderRadius: 16,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    padding: 20,
+    borderRadius: 14,
   },
   guidanceIcon: {
-    fontSize: 48,
-    marginBottom: 12,
+    fontSize: 36,
+    marginBottom: 8,
   },
   guidanceText: {
     color: '#fff',
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: '600',
-    marginBottom: 6,
+    marginBottom: 4,
   },
   guidanceSubtext: {
-    color: '#888',
-    fontSize: 14,
+    color: '#999',
+    fontSize: 13,
   },
-  readyContainer: {
+  // ── Status strip (bottom, compact pills) ──
+  statusStrip: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 12,
+    flexWrap: 'wrap',
+  },
+  statusChip: {
     flexDirection: 'row',
     alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+  },
+  statusChipWarn: {
+    backgroundColor: 'rgba(255,152,0,0.3)',
+  },
+  statusChipCaution: {
+    backgroundColor: 'rgba(255,235,59,0.2)',
+  },
+  statusChipGood: {
     backgroundColor: 'rgba(0,255,136,0.2)',
-    paddingHorizontal: 20,
-    paddingVertical: 12,
-    borderRadius: 20,
-    borderWidth: 2,
-    borderColor: '#00ff88',
   },
-  readyIcon: {
-    color: '#00ff88',
-    fontSize: 24,
-    marginRight: 10,
+  statusChipExplicit: {
+    backgroundColor: 'rgba(255,68,68,0.35)',
   },
-  readyText: {
-    color: '#00ff88',
-    fontSize: 18,
-    fontWeight: 'bold',
+  statusChipSensitive: {
+    backgroundColor: 'rgba(255,193,7,0.35)',
   },
-  warningContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(255,152,0,0.9)',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 20,
-    marginTop: 16,
-  },
-  warningIcon: {
-    fontSize: 18,
-    marginRight: 8,
-  },
-  warningText: {
+  statusChipText: {
     color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  readyPill: {
+    backgroundColor: 'rgba(0,255,136,0.15)',
+    paddingHorizontal: 20,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(0,255,136,0.4)',
+    marginBottom: 12,
+  },
+  readyPillText: {
+    color: '#00ff88',
     fontSize: 14,
     fontWeight: '600',
   },
@@ -900,24 +1433,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#ff9800',
   },
 
-  timerContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.8)',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 20,
-    marginTop: 16,
-  },
-  timerIcon: {
-    fontSize: 18,
-    marginRight: 8,
-  },
-  timerText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: 'bold',
-  },
   bottomBar: {
     alignItems: 'center',
     paddingBottom: 40,
@@ -1026,5 +1541,154 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+  // ═══ Consent Overlay Styles ═══
+  consentOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.88)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  consentCard: {
+    backgroundColor: '#16162a',
+    borderRadius: 24,
+    padding: 28,
+    width: '100%',
+    maxWidth: 380,
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,68,68,0.4)',
+    alignItems: 'center',
+  },
+  consentBadge: {
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    borderRadius: 20,
+    marginBottom: 16,
+  },
+  consentBadgeExplicit: {
+    backgroundColor: 'rgba(255,68,68,0.2)',
+  },
+  consentBadgeSensitive: {
+    backgroundColor: 'rgba(255,193,7,0.2)',
+  },
+  consentBadgeText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: 'bold',
+    letterSpacing: 1,
+  },
+  consentTitle: {
+    color: '#fff',
+    fontSize: 22,
+    fontWeight: 'bold',
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  consentDesc: {
+    color: '#aaa',
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 20,
+  },
+  consentCountdownRing: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    borderWidth: 3,
+    borderColor: '#ff4444',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  consentCountdownValue: {
+    color: '#ff4444',
+    fontSize: 28,
+    fontWeight: 'bold',
+    lineHeight: 30,
+  },
+  consentCountdownUnit: {
+    color: '#ff8888',
+    fontSize: 10,
+  },
+  consentBleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(99,102,241,0.12)',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    marginBottom: 16,
+    width: '100%',
+  },
+  consentBleText: {
+    color: '#a5b4fc',
+    fontSize: 13,
+    marginLeft: 10,
+    flex: 1,
+  },
+  consentDivider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    width: '100%',
+    marginBottom: 16,
+  },
+  consentDividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+  },
+  consentDividerText: {
+    color: '#666',
+    fontSize: 12,
+    marginHorizontal: 12,
+  },
+  consentButtons: {
+    width: '100%',
+  },
+  consentApproveBtn: {
+    backgroundColor: '#00ff88',
+    paddingVertical: 16,
+    borderRadius: 14,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  consentApproveBtnText: {
+    color: '#000',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  consentDenyBtn: {
+    backgroundColor: 'rgba(255,68,68,0.12)',
+    paddingVertical: 16,
+    borderRadius: 14,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255,68,68,0.4)',
+  },
+  consentDenyBtnText: {
+    color: '#ff4444',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  consentResult: {
+    alignItems: 'center',
+    paddingVertical: 24,
+  },
+  consentResultIcon: {
+    fontSize: 56,
+    marginBottom: 12,
+  },
+  consentResultText: {
+    color: '#fff',
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginBottom: 8,
+  },
+  consentResultSub: {
+    color: '#aaa',
+    fontSize: 14,
+    textAlign: 'center',
   },
 });

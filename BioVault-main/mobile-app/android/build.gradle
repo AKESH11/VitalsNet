@@ -6,6 +6,12 @@ buildscript {
         targetSdkVersion = 34
         ndkVersion = "26.1.10909125"
         kotlinVersion = "1.9.22"
+        // Point to react-native in hoisted root node_modules for libraries that need it
+        def rnDir = file("$rootDir/../node_modules/react-native")
+        if (!rnDir.exists()) {
+            rnDir = file("$rootDir/../../node_modules/react-native")
+        }
+        REACT_NATIVE_NODE_MODULES_DIR = rnDir.absolutePath
     }
 
     repositories {
@@ -24,8 +30,12 @@ allprojects {
     repositories {
         google()
         mavenCentral()
-        // React Native Community CLI Maven repo
-        maven { url("$rootDir/../node_modules/jsc-android/dist") }
+        // React Native Community CLI Maven repo (check hoisted root node_modules)
+        def jscDir = file("$rootDir/../node_modules/jsc-android/dist")
+        if (!jscDir.exists()) {
+            jscDir = file("$rootDir/../../node_modules/jsc-android/dist")
+        }
+        maven { url(jscDir.absolutePath) }
     }
 
     // RN 0.73+: artifact renamed from react-native → react-android.
@@ -42,6 +52,7 @@ allprojects {
 }
 
 // Ensure all subprojects (autolinked native modules) use consistent JVM target
+// and have namespace set (required by AGP 8+)
 subprojects {
     afterEvaluate { project ->
         if (project.hasProperty("android")) {
@@ -49,6 +60,17 @@ subprojects {
                 compileOptions {
                     sourceCompatibility JavaVersion.VERSION_17
                     targetCompatibility JavaVersion.VERSION_17
+                }
+                // Auto-set namespace from AndroidManifest.xml if missing
+                if (namespace == null || namespace.isEmpty()) {
+                    def manifest = file("${project.projectDir}/src/main/AndroidManifest.xml")
+                    if (manifest.exists()) {
+                        def parsed = new XmlParser().parse(manifest)
+                        def packageName = parsed.attribute("package")
+                        if (packageName) {
+                            namespace packageName
+                        }
+                    }
                 }
             }
         }

@@ -17,6 +17,7 @@ set(CORE_SOURCES
     ${CPP_CORE_DIR}/src/BioVaultExtractor.cpp
     ${CPP_CORE_DIR}/src/consensus_handshake.cpp
     ${CPP_CORE_DIR}/src/proof_of_reality.cpp
+    ${CPP_CORE_DIR}/src/watermark.cpp
 )
 
 # JNI bridge source

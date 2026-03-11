@@ -2,11 +2,14 @@
 #include "rppg_engine.h"
 #include "prnu_extractor.h"
 #include "crypto_utils.h"
+#include "watermark.h"
 #ifdef HAVE_OPENCV
 #include <opencv2/opencv.hpp>
 #endif
 #include <sstream>
 #include <vector>
+#include <mutex>
+#include <cstring>
 
 #ifdef ANDROID
 #include <android/log.h>
@@ -111,40 +114,81 @@ std::string BioVaultNative::calibrateHardware(const std::string& calibrationFram
 
     try {
 #ifdef HAVE_OPENCV
-        // Parse JSON array of frames (simplified parser)
-        // In production, use a proper JSON library like nlohmann/json
-        
-        std::vector<cv::Mat> frames;
-        // TODO: Parse calibrationFramesJson and decode each frame
-        
-        if (frames.size() < 50) {
-            return R"({"error": "Need at least 50 calibration frames"})";
-        }
-        
-        bool success = m_prnuExtractor->extractPattern(frames);
-#else
-        // Mock implementation without OpenCV
+        // calibrationFramesJson is now unused — use addCalibrationFrame() / finalizeCalibration() instead
         (void)calibrationFramesJson;
-        std::vector<void*> frames(50, nullptr);
-        bool success = m_prnuExtractor->extractPattern(frames);
+        return R"({"error": "Use addCalibrationFrame() + finalizeCalibration() for PRNU calibration"})";
+#else
+        (void)calibrationFramesJson;
+        return R"({"error": "OpenCV required for PRNU calibration"})";
 #endif
-        
-        if (!success) {
-            return R"({"error": "PRNU extraction failed"})";
-        }
-        
-        m_hardwareFingerprint = m_prnuExtractor->getHardwareFingerprint();
-        
-        std::stringstream result;
-        result << R"({"success": true, "hardwareFingerprint": ")" 
-               << m_hardwareFingerprint << R"("})";
-        
-        return result.str();
-        
     } catch (const std::exception& e) {
         LOGE("Hardware calibration error: %s", e.what());
         return R"({"error": ")" + std::string(e.what()) + R"("})";
     }
+}
+
+#ifdef HAVE_OPENCV
+bool BioVaultNative::addCalibrationFrame(const uint8_t* rgbaData, int width, int height) {
+    if (!m_isInitialized) return false;
+    try {
+        // Create cv::Mat from raw RGBA pixel data (4 channels)
+        cv::Mat rgba(height, width, CV_8UC4, const_cast<uint8_t*>(rgbaData));
+        cv::Mat bgr;
+        cv::cvtColor(rgba, bgr, cv::COLOR_RGBA2BGR);
+        // Deep-copy so caller's buffer can be freed
+        m_calibrationFrames.push_back(bgr.clone());
+        LOGI("PRNU calibration: added frame %zu/%d", m_calibrationFrames.size(), 50);
+        return true;
+    } catch (const std::exception& e) {
+        LOGE("addCalibrationFrame error: %s", e.what());
+        return false;
+    }
+}
+#else
+bool BioVaultNative::addCalibrationFrame(const uint8_t* rgbaData, int width, int height) {
+    (void)rgbaData; (void)width; (void)height;
+    LOGE("addCalibrationFrame: OpenCV required for real PRNU extraction");
+    return false;
+}
+#endif
+
+std::string BioVaultNative::finalizeCalibration() {
+    if (!m_isInitialized) {
+        return R"({"error": "Not initialized"})";
+    }
+    try {
+#ifdef HAVE_OPENCV
+        if (m_calibrationFrames.size() < 50) {
+            std::stringstream err;
+            err << R"({"error": "Need at least 50 frames, have )" << m_calibrationFrames.size() << R"("})";
+            return err.str();
+        }
+        bool success = m_prnuExtractor->extractPattern(m_calibrationFrames);
+        m_calibrationFrames.clear(); // free memory
+        if (!success) {
+            return R"({"error": "PRNU pattern extraction failed"})";
+        }
+        m_hardwareFingerprint = m_prnuExtractor->getHardwareFingerprint();
+        LOGI("PRNU calibration complete — fingerprint: %s", m_hardwareFingerprint.c_str());
+        std::stringstream result;
+        result << R"({"success": true, "hardwareFingerprint": ")" 
+               << m_hardwareFingerprint << R"("})";
+        return result.str();
+#else
+        return R"({"error": "OpenCV required for PRNU calibration"})";
+#endif
+    } catch (const std::exception& e) {
+        LOGE("finalizeCalibration error: %s", e.what());
+        m_calibrationFrames.clear();
+        return R"({"error": ")" + std::string(e.what()) + R"("})";
+    }
+}
+
+std::string BioVaultNative::getHardwareDNA() const {
+    if (m_hardwareFingerprint.empty()) {
+        return "";
+    }
+    return m_hardwareFingerprint;
 }
 
 std::string BioVaultNative::generateAnchorHash(
@@ -179,6 +223,7 @@ void BioVaultNative::reset() {
         m_rppgEngine->reset();
     }
     m_hardwareFingerprint.clear();
+    m_calibrationFrames.clear();
     LOGI("Bio-Vault reset");
 }
 
@@ -194,7 +239,7 @@ static biovault::BioVaultNative* g_nativeInstance = nullptr;
 extern "C" {
 
 JNIEXPORT jstring JNICALL
-Java_com_biovault_BioVaultModule_initialize(JNIEnv* env, jobject /* thiz */) {
+Java_com_biovault_BioVaultModule_nativeInitialize(JNIEnv* env, jobject /* thiz */) {
     if (!g_nativeInstance) {
         g_nativeInstance = new biovault::BioVaultNative();
     }
@@ -267,6 +312,99 @@ Java_com_biovault_BioVaultModule_reset(JNIEnv* /* env */, jobject /* thiz */) {
     if (g_nativeInstance) {
         g_nativeInstance->reset();
     }
+}
+
+// ---------------------------------------------------------------------------
+// PRNU Calibration JNI — incremental frame-by-frame approach
+// ---------------------------------------------------------------------------
+
+JNIEXPORT jboolean JNICALL
+Java_com_biovault_BioVaultModule_nativeAddCalibrationFrame(
+    JNIEnv* env, jobject /* thiz */,
+    jbyteArray rgbaData, jint width, jint height)
+{
+    if (!g_nativeInstance) return JNI_FALSE;
+
+    jsize len = env->GetArrayLength(rgbaData);
+    jbyte* bytes = env->GetByteArrayElements(rgbaData, nullptr);
+    if (!bytes) return JNI_FALSE;
+
+    bool ok = g_nativeInstance->addCalibrationFrame(
+        reinterpret_cast<const uint8_t*>(bytes), width, height);
+
+    env->ReleaseByteArrayElements(rgbaData, bytes, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_biovault_BioVaultModule_nativeFinalizeCalibration(
+    JNIEnv* env, jobject /* thiz */)
+{
+    if (!g_nativeInstance) {
+        return env->NewStringUTF(R"({"error": "Not initialized"})");
+    }
+    std::string result = g_nativeInstance->finalizeCalibration();
+    return env->NewStringUTF(result.c_str());
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_biovault_BioVaultModule_nativeGetHardwareDNA(
+    JNIEnv* env, jobject /* thiz */)
+{
+    if (!g_nativeInstance) {
+        return env->NewStringUTF("");
+    }
+    std::string dna = g_nativeInstance->getHardwareDNA();
+    return env->NewStringUTF(dna.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Watermark JNI — embed / extract
+// ---------------------------------------------------------------------------
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_biovault_BioVaultModule_nativeEmbedWatermark(
+    JNIEnv* env, jobject /* thiz */,
+    jbyteArray imageRgba, jint w, jint h, jstring payloadJson)
+{
+    jsize len = env->GetArrayLength(imageRgba);
+    jbyte* bytes = env->GetByteArrayElements(imageRgba, nullptr);
+    if (!bytes) return nullptr;
+
+    const char* payloadStr = env->GetStringUTFChars(payloadJson, nullptr);
+    std::string payload(payloadStr);
+    env->ReleaseStringUTFChars(payloadJson, payloadStr);
+
+    // Allocate output buffer (same size as input)
+    std::vector<uint8_t> outBuf(len);
+    bool ok = biovault::Watermark::embed(
+        reinterpret_cast<const uint8_t*>(bytes), w, h,
+        payload, outBuf.data());
+
+    env->ReleaseByteArrayElements(imageRgba, bytes, JNI_ABORT);
+
+    if (!ok) return nullptr;
+
+    jbyteArray result = env->NewByteArray(len);
+    env->SetByteArrayRegion(result, 0, len,
+                            reinterpret_cast<const jbyte*>(outBuf.data()));
+    return result;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_biovault_BioVaultModule_nativeExtractWatermark(
+    JNIEnv* env, jobject /* thiz */,
+    jbyteArray imageRgba, jint w, jint h)
+{
+    jsize len = env->GetArrayLength(imageRgba);
+    jbyte* bytes = env->GetByteArrayElements(imageRgba, nullptr);
+    if (!bytes) return env->NewStringUTF("");
+
+    std::string decoded = biovault::Watermark::extract(
+        reinterpret_cast<const uint8_t*>(bytes), w, h);
+
+    env->ReleaseByteArrayElements(imageRgba, bytes, JNI_ABORT);
+    return env->NewStringUTF(decoded.c_str());
 }
 
 // Consensus JNI methods are defined in android/app/src/main/cpp/native-lib.cpp

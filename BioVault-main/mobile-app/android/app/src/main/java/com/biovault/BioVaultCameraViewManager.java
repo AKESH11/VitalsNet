@@ -43,6 +43,7 @@ public class BioVaultCameraViewManager extends SimpleViewManager<TextureView> {
     private Handler backgroundHandler;
     private ImageReader imageReader;
     private Size previewSize = new Size(640, 480);
+    private boolean isCalibrationMode = false;
     
     @Override
     public String getName() {
@@ -102,6 +103,12 @@ public class BioVaultCameraViewManager extends SimpleViewManager<TextureView> {
         } else if (!active && cameraDevice != null) {
             closeCamera();
         }
+    }
+
+    @ReactProp(name = "calibrationMode", defaultBoolean = false)
+    public void setCalibrationMode(TextureView view, boolean calibrationMode) {
+        Log.d(TAG, "Calibration mode: " + calibrationMode);
+        isCalibrationMode = calibrationMode;
     }
     
     private void startBackgroundThread() {
@@ -337,6 +344,19 @@ public class BioVaultCameraViewManager extends SimpleViewManager<TextureView> {
             yBuffer.get(frameData, 0, ySize);
             uBuffer.get(frameData, ySize, uSize);
             vBuffer.get(frameData, ySize + uSize, vSize);
+
+            // CALIBRATION MODE: feed frames to PRNU extractor
+            if (isCalibrationMode && bioVaultModule != null) {
+                int count = bioVaultModule.addCalibrationFrameFromYUV(
+                    frameData, image.getWidth(), image.getHeight());
+                WritableMap event = Arguments.createMap();
+                event.putInt("calibrationFrameCount", count >= 0 ? count : 0);
+                event.putBoolean("calibrationMode", true);
+                event.putBoolean("calibrationComplete", count >= 50);
+                event.putDouble("timestamp", currentTime);
+                sendEvent(context, "onFrameAvailable", event);
+                return;
+            }
             
             // Process frame with native OpenCV code
             if (bioVaultModule != null) {

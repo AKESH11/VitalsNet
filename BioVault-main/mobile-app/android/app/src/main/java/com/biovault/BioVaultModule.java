@@ -38,6 +38,19 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     private boolean tscanAvailable = false;
     private int frameProcessCounter = 0;
     
+    // PRNU-derived hardware fingerprint (BLAKE3 hash of sensor noise)
+    // Replaces Build.FINGERPRINT — this is a real per-device unique identifier
+    private String cachedPRNUFingerprint = null;
+    private int calibrationFrameCount = 0;
+    
+    // rPPG session state — running content hash during recording
+    private boolean isRPPGSessionActive = false;
+    private java.security.MessageDigest videoDigest = null;
+    private int rppgFrameCount = 0;
+
+    // Last captured frame for watermark embedding (base64 JPEG)
+    private String lastFrameBase64 = null;
+
     // Face tracking stabilization (exponential moving average)
     private float[] smoothedFaceBounds = null;  // [x, y, width, height]
     private static final float FACE_SMOOTHING_ALPHA = 0.7f;  // Higher = more smoothing
@@ -48,6 +61,18 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
         this.strongBoxManager = new StrongBoxManager(context);
         instance = this;
         
+        // Restore cached PRNU fingerprint from SharedPreferences
+        try {
+            android.content.SharedPreferences prefs = context.getSharedPreferences("biovault_prnu", Context.MODE_PRIVATE);
+            String saved = prefs.getString("fingerprint", null);
+            if (saved != null && !saved.isEmpty()) {
+                cachedPRNUFingerprint = saved;
+                android.util.Log.i("BioVault", "Restored PRNU fingerprint from cache: " + saved.substring(0, Math.min(16, saved.length())) + "...");
+            }
+        } catch (Exception e) {
+            android.util.Log.w("BioVault", "Failed to restore PRNU cache: " + e.getMessage());
+        }
+
         // Initialize TS-CAN rPPG (NO FFT FALLBACK)
         try {
             tscanInference = new TSCANInference(context);
@@ -71,6 +96,13 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     public String getName() {
         return "BioVaultModule";
     }
+
+    // Required by NativeEventEmitter
+    @ReactMethod
+    public void addListener(String eventName) { /* no-op */ }
+
+    @ReactMethod
+    public void removeListeners(int count) { /* no-op */ }
 
     /**
      * Detects if device is high-end enough for PhysNet inference.
@@ -198,6 +230,9 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     private native String nativeInitialize();
     private native String processFrame(String frameData, int width, int height, String faceBounds);
     private native String calibrateHardware(String calibrationFramesJson);
+    private native boolean nativeAddCalibrationFrame(byte[] rgbaData, int width, int height);
+    private native String nativeFinalizeCalibration();
+    private native String nativeGetHardwareDNA();
     private native String generateAnchorHash(String frameData, int bpm, String hardwareID);
     private native byte[] generateBioVaultProof(byte[] frameData, int bpm, String hardwareID);
     private native boolean testStrongBoxSignature();
@@ -217,12 +252,15 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
             java.util.List<ConsentBroadcaster.BLESignatureData> signatures) {
         if (instance == null) return "";
         try {
-            // Init consensus session with empty frame hash and hardware DNA
+            // Use real PRNU hardware DNA instead of Build.FINGERPRINT
+            String hardwareDNA = instance.getResolvedHardwareDNA();
+
+            // Init consensus session with empty frame hash and real hardware DNA
             instance.initConsensusSession(
                 sessionId,
                 new int[signatures.size()],
                 new byte[0],
-                android.os.Build.FINGERPRINT);
+                hardwareDNA);
 
             // Append each peer's signature
             for (ConsentBroadcaster.BLESignatureData sig : signatures) {
@@ -246,6 +284,10 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     private native boolean nativeStartRPPGSession();
     private native String nativeStopRPPGSession();
     private native void nativeReleaseCamera();
+
+    // Watermark native methods (implemented in bio_vault_native.cpp)
+    private native byte[] nativeEmbedWatermark(byte[] imageRgba, int w, int h, String payloadJson);
+    private native String nativeExtractWatermark(byte[] imageRgba, int w, int h);
 
     @ReactMethod
     public void init(Promise promise) {
@@ -440,23 +482,6 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     // ============================================
     
     @ReactMethod
-    public void initializeCamera(Promise promise) {
-        try {
-            // Get path to OpenCV cascade files (bundled with OpenCV SDK)
-            String cascadePath = "/data/local/tmp/haarcascade_frontalface_default.xml";
-            boolean success = nativeInitializeCamera(cascadePath);
-            
-            if (success) {
-                promise.resolve(true);
-            } else {
-                promise.reject("CAMERA_INIT_ERROR", "Failed to initialize camera bridge");
-            }
-        } catch (Exception e) {
-            promise.reject("CAMERA_INIT_ERROR", e.getMessage());
-        }
-    }
-    
-    @ReactMethod
     public void processCameraFrame(String frameDataBase64, int width, int height, 
                                    int format, Promise promise) {
         try {
@@ -507,6 +532,12 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
                 return errorMap;
             }
             
+            // Accumulate content hash during active rPPG session
+            if (isRPPGSessionActive && videoDigest != null) {
+                videoDigest.update(frameData);
+                rppgFrameCount++;
+            }
+
             // Call C++ for face detection (but not FFT)
             String cppResult = nativeProcessCameraFrame(frameData, width, height, rotation);
             
@@ -554,6 +585,22 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
                     
                     // Get current BPM from TS-CAN inference
                     TSCANInference.InferenceResult result = tscanInference.getCurrentBPM();
+
+                    // Cache last frame as base64 JPEG for watermark embedding
+                    if (isRPPGSessionActive) {
+                        try {
+                            Bitmap snapBmp = yuvToBitmap(frameData, width, height, rotation);
+                            if (snapBmp != null) {
+                                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                                snapBmp.compress(Bitmap.CompressFormat.JPEG, 90, baos);
+                                snapBmp.recycle();
+                                lastFrameBase64 = android.util.Base64.encodeToString(
+                                    baos.toByteArray(), android.util.Base64.NO_WRAP);
+                            }
+                        } catch (Exception snapErr) {
+                            // Non-fatal
+                        }
+                    }
                     
                     // Create result map
                     WritableMap map = Arguments.createMap();
@@ -602,7 +649,19 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void startRPPGExtraction(Promise promise) {
         try {
+            // Initialize running SHA-256 content hash
+            videoDigest = java.security.MessageDigest.getInstance("SHA-256");
+            rppgFrameCount = 0;
+            isRPPGSessionActive = true;
+
+            // Reset TS-CAN session for fresh BPM accumulation
+            if (tscanInference != null) {
+                tscanInference.resetSession();
+            }
+
+            // Still call native for C++ face detection pipeline init
             boolean success = nativeStartRPPGSession();
+            android.util.Log.i("BioVault", "rPPG session started, content hash initialized");
             promise.resolve(success);
         } catch (Exception e) {
             promise.reject("RPPG_ERROR", e.getMessage());
@@ -640,13 +699,89 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void stopRPPGExtraction(Promise promise) {
         try {
-            String result = nativeStopRPPGSession();
-            
-            if (result != null) {
-                promise.resolve(result);
-            } else {
-                promise.reject("RPPG_ERROR", "Failed to stop rPPG session");
+            isRPPGSessionActive = false;
+
+            // 1. Real BPM from TS-CAN
+            float avgBPM = 0f;
+            float confidence = 0f;
+            if (tscanInference != null) {
+                TSCANInference.InferenceResult bpmResult = tscanInference.getAccumulatedBPM();
+                if (bpmResult.isValid) {
+                    avgBPM = bpmResult.bpm;
+                    confidence = bpmResult.confidence;
+                }
             }
+
+            // 2. Real SHA-256 content hash of all video frames
+            String videoHash = "";
+            if (videoDigest != null) {
+                byte[] hash = videoDigest.digest();
+                StringBuilder sb = new StringBuilder("0x");
+                for (byte b : hash) {
+                    sb.append(String.format("%02x", b));
+                }
+                videoHash = sb.toString();
+                videoDigest = null;
+            }
+
+            // 3. Real PRNU hardware DNA
+            String hardwareDNA = getResolvedHardwareDNA();
+
+            // 4. Bio-signature: SHA-256(bpm + hardwareDNA + timestamp)
+            String bioSignature = "";
+            try {
+                java.security.MessageDigest bioDigest = java.security.MessageDigest.getInstance("SHA-256");
+                String bioInput = Math.round(avgBPM) + ":" + hardwareDNA + ":" + System.currentTimeMillis();
+                byte[] bioHash = bioDigest.digest(bioInput.getBytes("UTF-8"));
+                StringBuilder sb = new StringBuilder("0x");
+                for (byte b : bioHash) {
+                    sb.append(String.format("%02x", b));
+                }
+                bioSignature = sb.toString();
+            } catch (Exception e) {
+                android.util.Log.w("BioVault", "Bio-signature computation failed: " + e.getMessage());
+            }
+
+            // 5. ML Kit content classification on last captured frame
+            String contentCategory = "SAFE";
+            boolean requiresConsent = false;
+            String contentLabel = "none";
+            float contentConfidence = 0f;
+            try {
+                if (lastFrameBase64 != null && !lastFrameBase64.isEmpty()) {
+                    byte[] frameBytes = android.util.Base64.decode(lastFrameBase64, android.util.Base64.DEFAULT);
+                    Bitmap frameBmp = BitmapFactory.decodeByteArray(frameBytes, 0, frameBytes.length);
+                    if (frameBmp != null) {
+                        ContentClassifier.ClassificationResult classResult = ContentClassifier.classify(frameBmp);
+                        frameBmp.recycle();
+                        contentCategory = classResult.category;
+                        requiresConsent = classResult.requiresConsent;
+                        contentLabel = classResult.topLabel;
+                        contentConfidence = classResult.topConfidence;
+                    }
+                }
+            } catch (Exception classifyErr) {
+                android.util.Log.w("BioVault", "Content classification failed: " + classifyErr.getMessage());
+            }
+
+            // Build real result JSON
+            org.json.JSONObject json = new org.json.JSONObject();
+            json.put("success", true);
+            json.put("videoHash", videoHash);
+            json.put("bioSignature", bioSignature);
+            json.put("hardwareDNA", hardwareDNA);
+            json.put("averageBPM", Math.round(avgBPM));
+            json.put("confidence", Math.round(confidence * 100) / 100.0);
+            json.put("frameCount", rppgFrameCount);
+            json.put("contentCategory", contentCategory);
+            json.put("requiresConsent", requiresConsent);
+            json.put("contentLabel", contentLabel);
+            json.put("contentConfidence", Math.round(contentConfidence * 100) / 100.0);
+
+            android.util.Log.i("BioVault", "rPPG session stopped — BPM=" + Math.round(avgBPM)
+                + " frames=" + rppgFrameCount + " hash=" + videoHash.substring(0, Math.min(18, videoHash.length())) + "...");
+
+            promise.resolve(json.toString());
         } catch (Exception e) {
             promise.reject("RPPG_ERROR", e.getMessage());
         }
@@ -682,8 +817,8 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void generateProofOfReality(int bpm, Promise promise) {
         try {
-            // Get hardware fingerprint
-            String hardwareID = Build.FINGERPRINT;
+            // Get real PRNU-derived hardware fingerprint (NOT Build.FINGERPRINT)
+            String hardwareID = getResolvedHardwareDNA();
 
             // Generate anchor hash via C++ (BLAKE3 of frame data + BPM + hardwareID)
             String proofHash = generateAnchorHash("", bpm, hardwareID);
@@ -719,13 +854,139 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
 
     /**
      * Get hardware fingerprint (PRNU-based device ID).
+     * Returns the real BLAKE3 hash of the camera sensor's PRNU noise pattern.
+     * Falls back to Build.FINGERPRINT only if PRNU calibration has not been run.
      */
     @ReactMethod
     public void getHardwareFingerprint(Promise promise) {
         try {
-            promise.resolve(Build.FINGERPRINT);
+            promise.resolve(getResolvedHardwareDNA());
         } catch (Exception e) {
             promise.reject("HW_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * Internal helper: returns the PRNU fingerprint if calibrated,
+     * or triggers a warning and returns a labelled fallback.
+     * NEVER returns raw Build.FINGERPRINT silently.
+     */
+    private String getResolvedHardwareDNA() {
+        // 1. Check JNI-cached value
+        if (cachedPRNUFingerprint != null && !cachedPRNUFingerprint.isEmpty()) {
+            return cachedPRNUFingerprint;
+        }
+        // 2. Ask the C++ layer (survives React Native reloads)
+        try {
+            String nativeDNA = nativeGetHardwareDNA();
+            if (nativeDNA != null && !nativeDNA.isEmpty()) {
+                cachedPRNUFingerprint = nativeDNA;
+                return cachedPRNUFingerprint;
+            }
+        } catch (Exception e) {
+            android.util.Log.w("BioVault", "nativeGetHardwareDNA failed: " + e.getMessage());
+        }
+        // 3. PRNU not calibrated yet — return clearly-labelled fallback
+        android.util.Log.w("BioVault", "PRNU not calibrated — hardware DNA unavailable. Run calibrateDevice first.");
+        return "UNCALIBRATED:" + Build.FINGERPRINT;
+    }
+
+    // ============================================
+    // PRNU Calibration (Incremental Frame API)
+    // ============================================
+
+    /**
+     * Add a single RGBA camera frame for PRNU calibration.
+     * Must be called at least 50 times before finalizeCalibration().
+     * @param frameDataBase64 Base64-encoded RGBA pixel data
+     * @param width  Frame width
+     * @param height Frame height
+     */
+    @ReactMethod
+    public void addCalibrationFrame(String frameDataBase64, int width, int height, Promise promise) {
+        try {
+            byte[] rgbaData = android.util.Base64.decode(frameDataBase64, android.util.Base64.DEFAULT);
+            boolean ok = nativeAddCalibrationFrame(rgbaData, width, height);
+            if (ok) calibrationFrameCount++;
+            promise.resolve(ok);
+        } catch (Exception e) {
+            promise.reject("CALIBRATE_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * Add a calibration frame directly from YUV camera data (called from CameraViewManager).
+     * Converts YUV to RGBA and feeds to native PRNU extractor.
+     * @return current frame count, or -1 on error
+     */
+    public int addCalibrationFrameFromYUV(byte[] yuvData, int width, int height) {
+        try {
+            Bitmap bitmap = yuvToBitmap(yuvData, width, height, 0);
+            if (bitmap == null) return -1;
+
+            Bitmap argb = bitmap.copy(Bitmap.Config.ARGB_8888, false);
+            bitmap.recycle();
+            if (argb == null) return -1;
+
+            int w = argb.getWidth();
+            int h = argb.getHeight();
+            int[] pixels = new int[w * h];
+            argb.getPixels(pixels, 0, w, 0, 0, w, h);
+            argb.recycle();
+
+            byte[] rgba = new byte[w * h * 4];
+            for (int i = 0; i < pixels.length; i++) {
+                int p = pixels[i];
+                rgba[i * 4]     = (byte)((p >> 16) & 0xFF);
+                rgba[i * 4 + 1] = (byte)((p >> 8) & 0xFF);
+                rgba[i * 4 + 2] = (byte)(p & 0xFF);
+                rgba[i * 4 + 3] = (byte)((p >> 24) & 0xFF);
+            }
+
+            boolean ok = nativeAddCalibrationFrame(rgba, w, h);
+            if (ok) {
+                calibrationFrameCount++;
+                return calibrationFrameCount;
+            }
+            return -1;
+        } catch (Exception e) {
+            android.util.Log.e("BioVault", "addCalibrationFrameFromYUV error: " + e.getMessage());
+            return -1;
+        }
+    }
+
+    @ReactMethod
+    public void getCalibrationFrameCount(Promise promise) {
+        promise.resolve(calibrationFrameCount);
+    }
+
+    /**
+     * Finalize PRNU calibration after >=50 frames have been added.
+     * On success, caches the BLAKE3 hardware fingerprint.
+     */
+    @ReactMethod
+    public void finalizeCalibration(Promise promise) {
+        try {
+            String resultJson = nativeFinalizeCalibration();
+            // Cache the fingerprint if present
+            if (resultJson != null && resultJson.contains("hardwareFingerprint")) {
+                try {
+                    org.json.JSONObject json = new org.json.JSONObject(resultJson);
+                    if (json.has("hardwareFingerprint")) {
+                        cachedPRNUFingerprint = json.getString("hardwareFingerprint");
+                        android.util.Log.i("BioVault", "PRNU fingerprint cached: " + cachedPRNUFingerprint);
+                        // Persist to SharedPreferences so it survives app restart
+                        android.content.SharedPreferences prefs = reactContext.getSharedPreferences("biovault_prnu", Context.MODE_PRIVATE);
+                        prefs.edit().putString("fingerprint", cachedPRNUFingerprint).apply();
+                    }
+                } catch (Exception parseErr) {
+                    android.util.Log.w("BioVault", "Failed to parse calibration result", parseErr);
+                }
+            }
+            calibrationFrameCount = 0;
+            promise.resolve(resultJson);
+        } catch (Exception e) {
+            promise.reject("CALIBRATE_ERROR", e.getMessage());
         }
     }
 
@@ -783,48 +1044,62 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     }
 
     // ============================================
-    // BLE Consensus Session
+    // BLE Consent Protocol
     // ============================================
 
     private ConsentBroadcaster consentBroadcaster;
 
+    private ConsentBroadcaster getOrCreateBroadcaster() {
+        if (consentBroadcaster == null) {
+            consentBroadcaster = new ConsentBroadcaster(reactContext);
+        }
+        return consentBroadcaster;
+    }
+
     /**
-     * Start a BLE consensus session for multi-party consent.
-     * @param sessionId Unique session identifier
-     * @param expectedFaces Number of faces/devices expected
+     * START CONSENT REQUEST — called by the recording device when sensitive
+     * content is detected.  Advertises via BLE and opens GATT server to
+     * receive approval/denial from nearby BioVault devices.
      */
     @ReactMethod
-    public void startConsensusSession(String sessionId, int expectedFaces, int myBpm, Promise promise) {
+    public void startBLEConsentSession(String sessionId, String category, Promise promise) {
         try {
-            if (consentBroadcaster == null) {
-                consentBroadcaster = new ConsentBroadcaster(reactContext);
-            }
+            ConsentBroadcaster cb = getOrCreateBroadcaster();
 
-            consentBroadcaster.startConsensusSession(sessionId, expectedFaces, myBpm,
-                new ConsentBroadcaster.ConsensusCallback() {
+            cb.startConsentRequest(sessionId, category,
+                new ConsentBroadcaster.ConsentRequesterCallback() {
                     @Override
-                    public void onConsensusComplete(String consensusHash, java.util.List<ConsentBroadcaster.BLESignatureData> signatures) {
+                    public void onApprovalReceived(String deviceAddress,
+                                                   ConsentBroadcaster.ApprovalData approval) {
                         WritableMap result = Arguments.createMap();
-                        result.putString("consensusHash", consensusHash);
-                        result.putInt("signaturesReceived", signatures.size());
-                        result.putBoolean("complete", true);
-
-                        // Emit event to JS
+                        result.putBoolean("approved", true);
+                        result.putString("deviceAddress", deviceAddress);
+                        result.putString("sessionId", sessionId);
                         reactContext
                             .getJSModule(com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                            .emit("onConsensusUpdate", result);
+                            .emit("onConsentApprovalReceived", result);
                     }
 
                     @Override
-                    public void onConsensusTimeout(int receivedCount, int expectedCount) {
+                    public void onDenialReceived(String deviceAddress) {
                         WritableMap result = Arguments.createMap();
-                        result.putInt("receivedCount", receivedCount);
-                        result.putInt("expectedCount", expectedCount);
-                        result.putBoolean("timeout", true);
-
+                        result.putBoolean("approved", false);
+                        result.putString("deviceAddress", deviceAddress);
+                        result.putString("sessionId", sessionId);
                         reactContext
                             .getJSModule(com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                            .emit("onConsensusUpdate", result);
+                            .emit("onConsentApprovalReceived", result);
+                    }
+
+                    @Override
+                    public void onRequestTimeout(int approvalsReceived) {
+                        WritableMap result = Arguments.createMap();
+                        result.putBoolean("timeout", true);
+                        result.putInt("approvalsReceived", approvalsReceived);
+                        result.putString("sessionId", sessionId);
+                        reactContext
+                            .getJSModule(com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                            .emit("onConsentApprovalReceived", result);
                     }
                 });
 
@@ -835,17 +1110,262 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
     }
 
     /**
-     * Stop the active BLE consensus session.
+     * STOP CONSENT REQUEST — stop advertising + close GATT server.
      */
     @ReactMethod
-    public void stopConsensusSession(Promise promise) {
+    public void stopBLEConsentSession(Promise promise) {
         try {
             if (consentBroadcaster != null) {
-                consentBroadcaster.stopConsensusSession();
+                consentBroadcaster.stopConsentRequest();
             }
             promise.resolve(true);
         } catch (Exception e) {
             promise.reject("BLE_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * START PASSIVE CONSENT SCANNING — called when the camera screen mounts.
+     * Listens for consent request advertisements from nearby recording devices.
+     * When one is found, emits 'onConsentRequestReceived' to JS.
+     */
+    @ReactMethod
+    public void startPassiveConsentScan(Promise promise) {
+        try {
+            android.util.Log.i("BioVault", "startPassiveConsentScan called — initializing passive BLE scan");
+            ConsentBroadcaster cb = getOrCreateBroadcaster();
+
+            cb.startPassiveScanning(
+                new ConsentBroadcaster.ConsentListenerCallback() {
+                    @Override
+                    public void onConsentRequestDiscovered(String deviceAddress,
+                                                           String sessionId,
+                                                           String category) {
+                        android.util.Log.i("BioVault", "onConsentRequestDiscovered: addr=" + deviceAddress
+                            + " session=" + sessionId + " category=" + category);
+                        WritableMap event = Arguments.createMap();
+                        event.putString("deviceAddress", deviceAddress);
+                        event.putString("sessionId", sessionId);
+                        event.putString("category", category);
+                        reactContext
+                            .getJSModule(com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                            .emit("onConsentRequestReceived", event);
+                    }
+                });
+
+            android.util.Log.i("BioVault", "startPassiveConsentScan: passive scanning initiated OK");
+            promise.resolve(true);
+        } catch (Exception e) {
+            android.util.Log.e("BioVault", "startPassiveConsentScan FAILED: " + e.getMessage());
+            promise.reject("BLE_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * STOP PASSIVE CONSENT SCANNING.
+     */
+    @ReactMethod
+    public void stopPassiveConsentScan(Promise promise) {
+        try {
+            if (consentBroadcaster != null) {
+                consentBroadcaster.stopPassiveScanning();
+            }
+            promise.resolve(true);
+        } catch (Exception e) {
+            promise.reject("BLE_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * RESPOND TO CONSENT REQUEST — called on the nearby device when user
+     * taps Approve or Deny.  Advertises the approval/denial response so the
+     * requester can pick it up via scanning.
+     */
+    @ReactMethod
+    public void respondToConsentRequest(String sessionId, boolean approved, Promise promise) {
+        try {
+            ConsentBroadcaster cb = getOrCreateBroadcaster();
+
+            cb.respondToConsentRequest(sessionId, approved, (success) -> {
+                if (success) {
+                    promise.resolve(true);
+                } else {
+                    promise.reject("BLE_ERROR", "Failed to send consent response");
+                }
+                return kotlin.Unit.INSTANCE;
+            });
+        } catch (Exception e) {
+            promise.reject("BLE_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * Get the last camera frame captured during recording as base64 JPEG.
+     */
+    @ReactMethod
+    public void captureLastFrame(Promise promise) {
+        if (lastFrameBase64 != null && !lastFrameBase64.isEmpty()) {
+            promise.resolve(lastFrameBase64);
+        } else {
+            promise.reject("CAPTURE_ERROR", "No frame available");
+        }
+    }
+
+    /**
+     * Classify the current camera frame mid-recording.
+     * Returns JSON: { category, requiresConsent, label, confidence }
+     */
+    @ReactMethod
+    public void classifyCurrentFrame(Promise promise) {
+        try {
+            if (lastFrameBase64 == null || lastFrameBase64.isEmpty()) {
+                org.json.JSONObject r = new org.json.JSONObject();
+                r.put("category", "SAFE");
+                r.put("requiresConsent", false);
+                r.put("label", "no_frame");
+                r.put("confidence", 0);
+                promise.resolve(r.toString());
+                return;
+            }
+            // Decode and classify on a background thread
+            new Thread(() -> {
+                try {
+                    byte[] frameBytes = android.util.Base64.decode(lastFrameBase64, android.util.Base64.DEFAULT);
+                    Bitmap frameBmp = BitmapFactory.decodeByteArray(frameBytes, 0, frameBytes.length);
+                    if (frameBmp == null) {
+                        org.json.JSONObject r = new org.json.JSONObject();
+                        r.put("category", "SAFE");
+                        r.put("requiresConsent", false);
+                        r.put("label", "decode_error");
+                        r.put("confidence", 0);
+                        promise.resolve(r.toString());
+                        return;
+                    }
+                    ContentClassifier.ClassificationResult cr = ContentClassifier.classify(frameBmp);
+                    frameBmp.recycle();
+                    org.json.JSONObject r = new org.json.JSONObject();
+                    r.put("category", cr.category);
+                    r.put("requiresConsent", cr.requiresConsent);
+                    r.put("label", cr.topLabel);
+                    r.put("confidence", Math.round(cr.topConfidence * 100));
+                    promise.resolve(r.toString());
+                } catch (Exception e) {
+                    promise.reject("CLASSIFY_ERROR", e.getMessage());
+                }
+            }).start();
+        } catch (Exception e) {
+            promise.reject("CLASSIFY_ERROR", e.getMessage());
+        }
+    }
+
+    // ============================================
+    // DWT+DCT+SVD Watermark (Phase 2)
+    // ============================================
+
+    /**
+     * Embed invisible watermark into an image.
+     * @param imageBase64 Base64-encoded JPEG/PNG image
+     * @param metadataJson JSON payload to embed (max ~60 chars)
+     * Returns base64-encoded watermarked PNG image.
+     */
+    @ReactMethod
+    public void embedWatermark(String imageBase64, String metadataJson, Promise promise) {
+        try {
+            byte[] imageBytes = android.util.Base64.decode(imageBase64, android.util.Base64.DEFAULT);
+            Bitmap bmp = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
+            if (bmp == null) {
+                promise.reject("WM_ERROR", "Failed to decode image");
+                return;
+            }
+
+            // Convert to ARGB_8888 → extract RGBA bytes
+            Bitmap argb = bmp.copy(Bitmap.Config.ARGB_8888, false);
+            bmp.recycle();
+            int w = argb.getWidth();
+            int h = argb.getHeight();
+            int[] pixels = new int[w * h];
+            argb.getPixels(pixels, 0, w, 0, 0, w, h);
+            argb.recycle();
+
+            byte[] rgba = new byte[w * h * 4];
+            for (int i = 0; i < pixels.length; i++) {
+                int p = pixels[i];
+                rgba[i * 4]     = (byte)((p >> 16) & 0xFF); // R
+                rgba[i * 4 + 1] = (byte)((p >> 8)  & 0xFF); // G
+                rgba[i * 4 + 2] = (byte)(p & 0xFF);          // B
+                rgba[i * 4 + 3] = (byte)((p >> 24) & 0xFF); // A
+            }
+
+            // Call C++ watermark embed
+            byte[] outRgba = nativeEmbedWatermark(rgba, w, h, metadataJson);
+            if (outRgba == null) {
+                promise.reject("WM_ERROR", "Native embed failed");
+                return;
+            }
+
+            // RGBA bytes → Bitmap → PNG → Base64
+            int[] outPixels = new int[w * h];
+            for (int i = 0; i < outPixels.length; i++) {
+                int r = outRgba[i * 4]     & 0xFF;
+                int g = outRgba[i * 4 + 1] & 0xFF;
+                int b = outRgba[i * 4 + 2] & 0xFF;
+                int a = outRgba[i * 4 + 3] & 0xFF;
+                outPixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+            Bitmap outBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            outBmp.setPixels(outPixels, 0, w, 0, 0, w, h);
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            outBmp.compress(Bitmap.CompressFormat.PNG, 100, baos);
+            outBmp.recycle();
+
+            String outBase64 = android.util.Base64.encodeToString(baos.toByteArray(), android.util.Base64.NO_WRAP);
+            promise.resolve(outBase64);
+        } catch (Exception e) {
+            promise.reject("WM_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * Extract watermark from an image.
+     * @param imageBase64 Base64-encoded JPEG/PNG image
+     * Returns the embedded JSON metadata or null.
+     */
+    @ReactMethod
+    public void extractWatermark(String imageBase64, Promise promise) {
+        try {
+            byte[] imageBytes = android.util.Base64.decode(imageBase64, android.util.Base64.DEFAULT);
+            Bitmap bmp = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
+            if (bmp == null) {
+                promise.reject("WM_ERROR", "Failed to decode image");
+                return;
+            }
+
+            Bitmap argb = bmp.copy(Bitmap.Config.ARGB_8888, false);
+            bmp.recycle();
+            int w = argb.getWidth();
+            int h = argb.getHeight();
+            int[] pixels = new int[w * h];
+            argb.getPixels(pixels, 0, w, 0, 0, w, h);
+            argb.recycle();
+
+            byte[] rgba = new byte[w * h * 4];
+            for (int i = 0; i < pixels.length; i++) {
+                int p = pixels[i];
+                rgba[i * 4]     = (byte)((p >> 16) & 0xFF);
+                rgba[i * 4 + 1] = (byte)((p >> 8)  & 0xFF);
+                rgba[i * 4 + 2] = (byte)(p & 0xFF);
+                rgba[i * 4 + 3] = (byte)((p >> 24) & 0xFF);
+            }
+
+            String decoded = nativeExtractWatermark(rgba, w, h);
+            if (decoded != null && !decoded.isEmpty()) {
+                promise.resolve(decoded);
+            } else {
+                promise.resolve(null);
+            }
+        } catch (Exception e) {
+            promise.reject("WM_ERROR", e.getMessage());
         }
     }
 }

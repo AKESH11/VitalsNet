@@ -8,44 +8,25 @@ import LoginScreen from './src/screens/LoginScreen';
 import HomeScreen from './src/screens/HomeScreen';
 import CameraScreen from './src/screens/CameraScreen';
 import ResultsScreen from './src/screens/ResultsScreen';
-import MediaLibraryScreen from './src/screens/MediaLibraryScreen';
 import VerifyScreen from './src/screens/VerifyScreen';
-
-// Note: react-native-gesture-handler is imported in index.js (must be first import)
+import CalibrationScreen from './src/screens/CalibrationScreen';
 
 const Stack = createStackNavigator();
 
-/**
- * Deep linking configuration
- * Supports:
- *   biovault://verify/0xMediaHash      → VerifyScreen
- *   biovault://home                     → HomeScreen
- *   biovault://camera                   → CameraScreen
- *   biovault://library                  → MediaLibraryScreen
- *   https://biovault.io/verify/0xHash   → VerifyScreen (Universal Link)
- */
 const linking = {
   prefixes: ['biovault://', 'https://biovault.io'],
   config: {
     screens: {
       Home: 'home',
-      Camera: 'camera',
-      Verify: {
-        path: 'verify/:mediaHash?',
-      },
-      MediaLibrary: 'library',
-      Results: 'results',
+      Camera: 'capture',
+      Verify: 'verify/:captureId?',
     },
   },
-  // Handle links that arrive before NavigationContainer is ready
   async getInitialURL() {
-    const url = await Linking.getInitialURL();
-    return url;
+    return await Linking.getInitialURL();
   },
   subscribe(listener) {
-    const subscription = Linking.addEventListener('url', ({ url }) => {
-      listener(url);
-    });
+    const subscription = Linking.addEventListener('url', ({ url }) => listener(url));
     return () => subscription.remove();
   },
 };
@@ -60,14 +41,13 @@ export default function App() {
             screenOptions={{
               headerShown: false,
               cardStyle: { backgroundColor: '#0f0f23' },
-              // Enable iOS-style swipe-back gesture
               gestureEnabled: true,
             }}>
             <Stack.Screen name="Login" component={LoginScreen} />
+            <Stack.Screen name="Calibration" component={CalibrationScreen} />
             <Stack.Screen name="Home" component={HomeScreen} />
             <Stack.Screen name="Camera" component={CameraScreen} />
             <Stack.Screen name="Results" component={ResultsScreen} />
-            <Stack.Screen name="MediaLibrary" component={MediaLibraryScreen} />
             <Stack.Screen name="Verify" component={VerifyScreen} />
           </Stack.Navigator>
         </NavigationContainer>

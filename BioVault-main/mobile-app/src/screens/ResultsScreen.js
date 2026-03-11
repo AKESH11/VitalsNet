@@ -1,428 +1,323 @@
-import React, {useState, useRef} from 'react';
-import {View, Text, StyleSheet, ScrollView, TouchableOpacity, Alert, Share, Clipboard} from 'react-native';
+import React, {useState, useEffect} from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  ScrollView,
+  Share,
+  Alert,
+} from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import apiService from '../services/ApiService';
-import anchorQueue from '../services/AnchorQueue';
-import RNFS from 'react-native-fs';
+import CryptoJS from 'crypto-js';
 
-// Utility: convert a string to base64 (for IPFS upload)
-function stringToBase64(str) {
-  const { Buffer } = require('buffer');
-  return Buffer.from(str, 'utf-8').toString('base64');
-}
+const CAPTURES_KEY = 'biovault_captures';
 
-/**
- * Retry a function up to maxRetries times with exponential backoff.
- */
-async function withRetry(fn, maxRetries = 3, baseDelayMs = 1000) {
-  let lastError;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-      if (attempt < maxRetries) {
-        const delay = baseDelayMs * Math.pow(2, attempt);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-  }
-  throw lastError;
-}
-
-export default function ResultsScreen({navigation, route}) {
-  const [isAnchoring, setIsAnchoring] = useState(false);
-  const [anchorStatus, setAnchorStatus] = useState(null);
-  const [anchorResult, setAnchorResult] = useState(null);
-  const [ipfsResult, setIpfsResult] = useState(null);
-
-  const data = route?.params || {};
+export default function ResultsScreen({route, navigation}) {
   const {
-    bpm = 72,
-    confidence = 85,
-    duration = 30,
-    facesDetected = 1,
+    bpm = 0,
+    confidence = 0,
+    duration = 0,
+    facesDetected = 0,
     framesProcessed = 0,
     statistics = {},
     videoHash = '',
     bioSignature = '',
     hardwareDNA = '',
+    hardwareFingerprint = '',
     proofOfRealityHash = '',
-    mediaFilePath = null,
-  } = data;
+    mediaFilePath = '',
+    watermarkedImageBase64 = '',
+    contentCategory = 'SAFE',
+    requiresConsent = false,
+    contentLabel = '',
+    contentConfidence = 0,
+    consentParties = null,
+  } = route.params || {};
 
-  // Use the real parameters or fallback to defaults
-  const averageBPM = bpm || data.averageBPM || 72;
-  const confidenceScore = confidence || 85;
-  const recordingDuration = duration || 30;
-  const faceCount = facesDetected || data.faceCount || 1;
+  const [captureId, setCaptureId] = useState('');
+  const [contentHash, setContentHash] = useState('');
+  const [saved, setSaved] = useState(false);
 
-  const anchorToBlockchain = async () => {
-    console.log('[BioVault] Anchor button tapped — starting anchor flow');
-    setIsAnchoring(true);
+  // Determine the device fingerprint — use PRNU if available, else hardwareDNA
+  const deviceFingerprint = hardwareFingerprint || hardwareDNA || '';
+  const hasDeviceBinding = deviceFingerprint.length > 8;
+  const hasBioSignal = bpm > 40 && bpm < 180 && confidence > 20;
+
+  // Origin status
+  const originVerified = hasDeviceBinding && hasBioSignal;
+
+  useEffect(() => {
+    // Generate a deterministic capture ID from content
+    const timestamp = Date.now();
+    const raw = `${bpm}:${confidence}:${deviceFingerprint}:${timestamp}`;
+    const hash = CryptoJS.SHA256(raw).toString();
+    const id = 'BV-' + hash.substring(0, 12).toUpperCase();
+    setCaptureId(id);
+
+    // Generate content hash (replaces broken IPFS)
+    const contentData = `${videoHash}:${bioSignature}:${deviceFingerprint}:${bpm}:${framesProcessed}`;
+    const cHash = CryptoJS.SHA256(contentData).toString();
+    setContentHash(cHash);
+
+    // Auto-save capture record
+    saveCaptureRecord(id, cHash, timestamp);
+  }, []);
+
+  const saveCaptureRecord = async (id, cHash, timestamp) => {
     try {
-      // Step 1: Upload Proof of Reality metadata to IPFS
-      const proofOfRealityJSON = {
-        bpm: averageBPM,
-        confidence: confidenceScore,
-        duration: recordingDuration,
-        facesDetected: faceCount,
+      const record = {
+        captureId: id,
+        contentHash: cHash,
+        timestamp,
+        bpm,
+        confidence,
+        duration,
+        facesDetected,
         framesProcessed,
+        deviceFingerprint: deviceFingerprint.substring(0, 32) + '...',
+        bioSignature: bioSignature.substring(0, 32) + '...',
+        originVerified,
         statistics,
-        hardwareDNA,
-        timestamp: Date.now(),
       };
-      const proofData = stringToBase64(JSON.stringify(proofOfRealityJSON));
 
-      let proofIPFSCID = '';
-      let mediaIPFSCID = '';
-      try {
-        // Upload proof-of-reality metadata to IPFS (smart: backend → Pinata fallback)
-        const ipfsUpload = await withRetry(
-          () => apiService.smartUploadToIPFS({
-            data: proofData,
-            filename: 'proof_of_reality.json',
-            metadata: proofOfRealityJSON,
-          }),
-          2, // 2 retries (3 total attempts)
-          1500,
-        );
-        proofIPFSCID = ipfsUpload.cid || '';
-        mediaIPFSCID = ipfsUpload.metadataCID || proofIPFSCID;
-
-        // If we have a saved media file on disk, also upload it
-        if (mediaFilePath) {
-          try {
-            const fileExists = await RNFS.exists(mediaFilePath);
-            if (fileExists) {
-              const fileContent = await RNFS.readFile(mediaFilePath, 'utf8');
-              const fileBase64 = stringToBase64(fileContent);
-              const mediaUpload = await apiService.smartUploadToIPFS({
-                data: fileBase64,
-                filename: 'recording_data.json',
-                metadata: { type: 'biovault_recording', proof: proofIPFSCID },
-              });
-              if (mediaUpload.cid) {
-                mediaIPFSCID = mediaUpload.cid;
-              }
-            }
-          } catch (fileErr) {
-            console.warn('Media file IPFS upload failed:', fileErr.message);
-          }
-        }
-
-        setIpfsResult(ipfsUpload);
-      } catch (ipfsError) {
-        console.warn('IPFS upload failed, continuing without:', ipfsError.message);
-        // Continue anchoring even if IPFS is down — hash is still on-chain
-      }
-
-      // Step 2: Compute a deterministic media hash if none was provided
-      // The hash must be unique per recording for the on-chain anchor
-      // Reject: empty, all-zeros, or non-hex strings (e.g. native module error messages)
-      const isInvalidHash = (h) => !h || /^(0x)?0+$/.test(h) || !/^(0x)?[0-9a-fA-F]{8,}$/.test(h);
-      let effectiveHash = (!isInvalidHash(videoHash) && videoHash) || (!isInvalidHash(proofOfRealityHash) && proofOfRealityHash);
-      console.log('[BioVault] Hash check: videoHash invalid?', isInvalidHash(videoHash), 'proofHash invalid?', isInvalidHash(proofOfRealityHash), 'effectiveHash:', effectiveHash ? effectiveHash.slice(0, 20) + '...' : 'NONE (will SHA-256)');
-      if (!effectiveHash) {
-        // Deterministic fallback: SHA-256 of proof-of-reality data
-        // Uses crypto-js (React Native compatible) — NOT Node.js crypto
-        const CryptoJS = require('crypto-js');
-        const hashInput = JSON.stringify(proofOfRealityJSON);
-        effectiveHash = CryptoJS.SHA256(hashInput).toString(CryptoJS.enc.Hex);
-        console.log('[BioVault] Generated SHA-256 fallback hash:', effectiveHash.slice(0, 20) + '...');
-      }
-
-      // Step 3: Anchor to blockchain (smart: backend → in-app wallet fallback)
-      let result;
-      try {
-        result = await withRetry(
-          () => apiService.smartAnchorMedia({
-            mediaHash: effectiveHash,
-            bioSignature: bioSignature || `bpm:${averageBPM}:conf:${confidenceScore}`,
-            hardwareID: hardwareDNA || 'unknown-device',
-            consensusParties: [], // Solo recording — no multi-party consent
-            ipfsHash: mediaIPFSCID || proofIPFSCID || '',
-            proofOfRealityHash: proofOfRealityHash || '',
-            proofOfRealityIPFS: proofIPFSCID || '',
-            allUniqueSignals: true,
-            detectedFaces: faceCount,
-          }),
-          2, // 2 retries
-          2000,
-        );
-      } catch (anchorErr) {
-        console.log('[BioVault] Anchor call error:', anchorErr.message);
-        // 409 = already anchored — treat as success (media IS on-chain)
-        if (anchorErr.message && anchorErr.message.includes('already anchored')) {
-          result = { success: true, alreadyAnchored: true, mediaHash: effectiveHash };
-        } else {
-          throw anchorErr; // re-throw for the outer catch to handle
-        }
-      }
-
-      console.log('[BioVault] Anchor result:', JSON.stringify({ success: result?.success, alreadyAnchored: result?.alreadyAnchored, tx: result?.transactionHash?.slice(0, 18) }));
-      setAnchorResult(result);
-      setAnchorStatus('success');
-
-      // Step 4: Save to local storage for "My Media" screen
-      try {
-        const existing = await AsyncStorage.getItem('biovault_anchored_media');
-        const mediaList = existing ? JSON.parse(existing) : [];
-        mediaList.unshift({
-          mediaHash: effectiveHash,
-          txHash: result.transactionHash,
-          blockNumber: result.blockNumber,
-          ipfsCID: mediaIPFSCID || proofIPFSCID,
-          bpm: averageBPM,
-          confidence: confidenceScore,
-          timestamp: Date.now(),
-          facesDetected: faceCount,
-        });
-        await AsyncStorage.setItem('biovault_anchored_media', JSON.stringify(mediaList));
-      } catch (storageError) {
-        console.warn('Failed to save to storage:', storageError.message);
-      }
-
-      Alert.alert(
-        result.alreadyAnchored ? 'Already On-Chain' : 'Blockchain Anchored',
-        result.alreadyAnchored
-          ? `This media is already anchored on-chain.\n\nHash: ${effectiveHash.slice(0, 20)}...`
-          : `Transaction confirmed on Polygon Amoy!\n\n` +
-            `Tx: ${result.transactionHash.slice(0, 18)}...\n` +
-            `Block: ${result.blockNumber}\n` +
-            `Gas: ${result.gasUsed}\n` +
-            (proofIPFSCID ? `\nIPFS: ${proofIPFSCID}` : ''),
-        [{text: 'OK'}]
-      );
-
-    } catch (error) {
-      setAnchorStatus('error');
-
-      // Enqueue for offline retry
-      const isInvalidHash = (h) => !h || /^(0x)?0+$/.test(h) || !/^(0x)?[0-9a-fA-F]{8,}$/.test(h);
-      const CryptoJS = require('crypto-js');
-      const fallbackHash = CryptoJS.SHA256(JSON.stringify({
-        bpm: averageBPM, confidence: confidenceScore, duration: recordingDuration,
-        facesDetected: faceCount, timestamp: Date.now(),
-      })).toString(CryptoJS.enc.Hex);
-      const anchorPayload = {
-        mediaHash: (!isInvalidHash(videoHash) && videoHash) || (!isInvalidHash(proofOfRealityHash) && proofOfRealityHash) || fallbackHash,
-        bioSignature: bioSignature || `bpm:${averageBPM}:conf:${confidenceScore}`,
-        hardwareID: hardwareDNA || 'unknown-device',
-        consensusParties: [],
-        ipfsHash: '',
-        proofOfRealityHash: proofOfRealityHash || '',
-        proofOfRealityIPFS: '',
-        allUniqueSignals: true,
-        detectedFaces: faceCount,
-      };
-      try {
-        const queueCount = await anchorQueue.enqueue(anchorPayload, {
-          bpm: averageBPM,
-          confidence: confidenceScore,
-        });
-        Alert.alert(
-          'Saved to Offline Queue',
-          `Could not anchor now:\n${error.message}\n\nYour recording has been queued and will anchor automatically when the server is reachable.\n\n${queueCount} item(s) in queue.`,
-          [{text: 'OK'}]
-        );
-      } catch (queueError) {
-        Alert.alert(
-          'Anchoring Failed',
-          `Could not anchor to blockchain:\n\n${error.message}\n\nMake sure the backend server is running.`,
-          [{text: 'OK'}]
-        );
-      }
-    } finally {
-      setIsAnchoring(false);
+      const existing = await AsyncStorage.getItem(CAPTURES_KEY);
+      const captures = existing ? JSON.parse(existing) : [];
+      captures.unshift(record);
+      // Keep last 50 captures
+      if (captures.length > 50) captures.length = 50;
+      await AsyncStorage.setItem(CAPTURES_KEY, JSON.stringify(captures));
+      setSaved(true);
+    } catch (e) {
+      console.warn('Failed to save capture:', e);
     }
   };
 
-  const shareResults = async () => {
-    const shareText =
-      `BioVault Proof of Reality\n\n` +
-      `Video Hash: ${videoHash || 'N/A'}\n` +
-      `Bio-Signature: ${bioSignature || 'N/A'}\n` +
-      `Hardware DNA: ${hardwareDNA || 'N/A'}\n` +
-      `BPM: ${averageBPM} (${confidenceScore}% confidence)\n` +
-      (anchorResult
-        ? `\nBlockchain Tx: ${anchorResult.transactionHash}\nBlock: ${anchorResult.blockNumber}\n`
-        : '') +
-      (ipfsResult?.cid ? `IPFS CID: ${ipfsResult.cid}\n` : '') +
-      `\nVerify at: https://amoy.polygonscan.com/`;
-
+  const handleShare = async () => {
     try {
       await Share.share({
-        message: shareText,
-        title: 'BioVault Proof of Reality',
+        message:
+          `BioVault Proof of Origin\n\n` +
+          `Capture ID: ${captureId}\n` +
+          `Status: ${originVerified ? 'ORIGIN VERIFIED' : 'UNVERIFIED'}\n` +
+          `Device-Bound: ${hasDeviceBinding ? 'Yes' : 'No'}\n` +
+          `Bio-Signal: ${hasBioSignal ? 'Detected' : 'None'}\n` +
+          `Content Hash: ${contentHash.substring(0, 16)}...\n` +
+          `Timestamp: ${new Date().toISOString()}\n\n` +
+          `Verify at: biovault://verify/${captureId}`,
       });
-    } catch (error) {
-      // Fallback: copy to clipboard
-      if (Clipboard && Clipboard.setString) {
-        Clipboard.setString(shareText);
-        Alert.alert('Copied', 'Results copied to clipboard.');
-      }
+    } catch (e) {
+      console.warn('Share failed:', e);
     }
   };
 
   return (
     <View style={styles.container}>
-      <View style={styles.header}>
-        <TouchableOpacity
-          style={styles.backButton}
-          onPress={() => navigation.goBack()}>
-          <Text style={styles.backButtonText}>←</Text>
-        </TouchableOpacity>
-        <Text style={styles.headerTitle}>Bio-Signature Results</Text>
-      </View>
-
-      <ScrollView style={styles.content}>
-        <View style={styles.successCard}>
-          <Text style={styles.successIcon}>✓</Text>
-          <Text style={styles.successTitle}>Extraction Complete</Text>
-          <Text style={styles.successSubtitle}>
-            Bio-signature successfully captured
+      <ScrollView contentContainerStyle={styles.scroll}>
+        {/* Origin Status Badge */}
+        <View style={[styles.statusBadge, originVerified ? styles.verified : styles.unverified]}>
+          <Text style={styles.statusIcon}>{originVerified ? '✅' : '⚠️'}</Text>
+          <Text style={[styles.statusTitle, originVerified ? styles.verifiedText : styles.unverifiedText]}>
+            {originVerified ? 'ORIGIN VERIFIED' : 'ORIGIN UNVERIFIED'}
+          </Text>
+          <Text style={styles.statusSubtitle}>
+            {originVerified
+              ? 'This media was captured on a verified device with a live biological signal'
+              : 'Insufficient device binding or biological signal detected'}
           </Text>
         </View>
 
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>📊 Bio-Metrics</Text>
-          
-          <View style={styles.metricRow}>
-            <Text style={styles.metricLabel}>Average Heart Rate</Text>
-            <Text style={styles.metricValue}>{averageBPM} BPM</Text>
-          </View>
-
-          <View style={styles.metricRow}>
-            <Text style={styles.metricLabel}>Confidence Score</Text>
-            <Text style={[styles.metricValue, styles.successText]}>
-              {confidenceScore}%
-            </Text>
-          </View>
-
-          <View style={styles.metricRow}>
-            <Text style={styles.metricLabel}>Recording Duration</Text>
-            <Text style={styles.metricValue}>{recordingDuration}s</Text>
-          </View>
-
-          <View style={styles.metricRow}>
-            <Text style={styles.metricLabel}>Faces Detected</Text>
-            <Text style={styles.metricValue}>{faceCount}</Text>
-          </View>
-          
-          {framesProcessed > 0 && (
-            <View style={styles.metricRow}>
-              <Text style={styles.metricLabel}>Frames Processed</Text>
-              <Text style={styles.metricValue}>{framesProcessed}</Text>
-            </View>
-          )}
-          
-          {statistics && statistics.stdDev && (
-            <View style={styles.metricRow}>
-              <Text style={styles.metricLabel}>Variability (σ)</Text>
-              <Text style={styles.metricValue}>{statistics.stdDev}</Text>
-            </View>
-          )}
+        {/* Capture ID */}
+        <View style={styles.captureIdBox}>
+          <Text style={styles.captureIdLabel}>Capture ID</Text>
+          <Text style={styles.captureIdValue}>{captureId}</Text>
+          {saved && <Text style={styles.savedTag}>💾 Saved locally</Text>}
         </View>
 
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>🔐 Signatures</Text>
-          
-          <View style={styles.signatureBlock}>
-            <Text style={styles.signatureLabel}>Video Hash (IPFS)</Text>
-            <Text style={styles.signatureValue} numberOfLines={1}>
-              {videoHash}
-            </Text>
+        {/* Device DNA Section */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>🔬 Device DNA</Text>
+          <Text style={styles.sectionDesc}>
+            Hardware fingerprint derived from camera sensor imperfections (PRNU)
+          </Text>
+          <View style={styles.row}>
+            <Text style={styles.label}>Status</Text>
+            <View style={[styles.tag, hasDeviceBinding ? styles.tagGreen : styles.tagRed]}>
+              <Text style={styles.tagText}>{hasDeviceBinding ? 'BOUND' : 'NOT DETECTED'}</Text>
+            </View>
           </View>
-
-          <View style={styles.signatureBlock}>
-            <Text style={styles.signatureLabel}>Bio-Signature</Text>
-            <Text style={styles.signatureValue} numberOfLines={1}>
-              {bioSignature}
-            </Text>
-          </View>
-
-          <View style={styles.signatureBlock}>
-            <Text style={styles.signatureLabel}>Hardware DNA</Text>
-            <Text style={styles.signatureValue} numberOfLines={1}>
-              {hardwareDNA}
-            </Text>
-          </View>
-        </View>
-
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>⛓️ Blockchain</Text>
-          
-          {!anchorStatus ? (
-            <View>
-              <Text style={styles.infoText}>
-                Anchor this bio-signature to Polygon blockchain for immutable 
-                proof of authenticity and timestamp.
+          {hasDeviceBinding && (
+            <View style={styles.row}>
+              <Text style={styles.label}>Fingerprint</Text>
+              <Text style={styles.valueSmall} numberOfLines={1}>
+                {deviceFingerprint.substring(0, 24)}...
               </Text>
-              
-              <TouchableOpacity
-                style={[styles.anchorButton, isAnchoring && styles.anchorButtonDisabled]}
-                onPress={anchorToBlockchain}
-                disabled={isAnchoring}>
-                <Text style={styles.anchorButtonText}>
-                  {isAnchoring ? 'Uploading to IPFS & anchoring...' : 'Anchor to Blockchain'}
-                </Text>
-              </TouchableOpacity>
             </View>
-          ) : anchorStatus === 'success' ? (
-            <View>
-              <View style={styles.anchorSuccess}>
-                <Text style={styles.anchorSuccessIcon}>&#x2713;</Text>
-                <Text style={styles.anchorSuccessText}>
-                  Anchored on Polygon Amoy
+          )}
+        </View>
+
+        {/* Bio-Signal Section */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>💚 Biological Signal</Text>
+          <Text style={styles.sectionDesc}>
+            Physiological signal extracted from facial video via rPPG
+          </Text>
+          <View style={styles.row}>
+            <Text style={styles.label}>Heart Rate</Text>
+            <Text style={styles.value}>{bpm} BPM</Text>
+          </View>
+          <View style={styles.row}>
+            <Text style={styles.label}>Signal Confidence</Text>
+            <Text style={[styles.value, confidence >= 60 ? styles.green : confidence >= 40 ? styles.yellow : styles.red]}>
+              {confidence}%
+            </Text>
+          </View>
+          <View style={styles.row}>
+            <Text style={styles.label}>Duration</Text>
+            <Text style={styles.value}>{duration}s</Text>
+          </View>
+          <View style={styles.row}>
+            <Text style={styles.label}>Frames Analyzed</Text>
+            <Text style={styles.value}>{framesProcessed}</Text>
+          </View>
+          {statistics.min !== undefined && (
+            <View style={styles.row}>
+              <Text style={styles.label}>BPM Range</Text>
+              <Text style={styles.value}>{statistics.min} — {statistics.max}</Text>
+            </View>
+          )}
+        </View>
+
+        {/* Content Hash */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>🔗 Content Hash</Text>
+          <Text style={styles.sectionDesc}>
+            SHA-256 hash of capture data — tamper-proof content fingerprint
+          </Text>
+          <View style={styles.hashBox}>
+            <Text style={styles.hashText} selectable>
+              {contentHash || 'Computing...'}
+            </Text>
+          </View>
+        </View>
+
+        {/* Proof of Reality */}
+        {proofOfRealityHash ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>🛡️ Proof of Reality</Text>
+            <View style={styles.hashBox}>
+              <Text style={styles.hashText} selectable>
+                {proofOfRealityHash}
+              </Text>
+            </View>
+          </View>
+        ) : null}
+
+        {/* Watermark Status */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>🔏 Invisible Watermark</Text>
+          <Text style={styles.sectionDesc}>
+            DWT+DCT+SVD blind watermark embedded in captured image
+          </Text>
+          <View style={styles.row}>
+            <Text style={styles.label}>Status</Text>
+            <View style={[styles.tag, watermarkedImageBase64 ? styles.tagGreen : styles.tagRed]}>
+              <Text style={styles.tagText}>{watermarkedImageBase64 ? 'EMBEDDED' : 'NOT AVAILABLE'}</Text>
+            </View>
+          </View>
+          {watermarkedImageBase64 ? (
+            <View style={styles.row}>
+              <Text style={styles.label}>Payload</Text>
+              <Text style={styles.valueSmall}>BPM + Device DNA + Timestamp</Text>
+            </View>
+          ) : null}
+        </View>
+
+        {/* Content Classification (ML Kit) */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>🤖 Content Classification</Text>
+          <Text style={styles.sectionDesc}>
+            ML Kit Image Labeling analysis of captured frame
+          </Text>
+          <View style={styles.row}>
+            <Text style={styles.label}>Category</Text>
+            <View style={[styles.tag,
+              contentCategory === 'SAFE' ? styles.tagGreen :
+              contentCategory === 'SENSITIVE' ? styles.tagOrange :
+              styles.tagRed]}>
+              <Text style={styles.tagText}>{contentCategory}</Text>
+            </View>
+          </View>
+          {contentLabel ? (
+            <View style={styles.row}>
+              <Text style={styles.label}>Top Label</Text>
+              <Text style={styles.value}>{contentLabel} ({Math.round(contentConfidence * 100)}%)</Text>
+            </View>
+          ) : null}
+          <View style={styles.row}>
+            <Text style={styles.label}>Consent Required</Text>
+            <View style={[styles.tag, requiresConsent ? styles.tagOrange : styles.tagGreen]}>
+              <Text style={styles.tagText}>{requiresConsent ? 'YES' : 'NO'}</Text>
+            </View>
+          </View>
+          {requiresConsent ? (
+            <Text style={[styles.sectionDesc, {color: '#ff9500', marginTop: 4}]}>
+              ⚠️ Inappropriate content detected — this media may violate content policies
+            </Text>
+          ) : null}
+        </View>
+
+        {/* BLE Consent Status */}
+        {consentParties ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>🤝 Consent Verification</Text>
+            <View style={styles.row}>
+              <Text style={styles.label}>Method</Text>
+              <View style={[styles.tag, consentParties.consentMethod === 'ble' ? styles.tagGreen : styles.tagOrange]}>
+                <Text style={styles.tagText}>
+                  {consentParties.consentMethod === 'ble' ? 'BLE P2P' : 'SELF-APPROVED'}
                 </Text>
               </View>
-              {anchorResult && (
-                <View style={{marginTop: 12}}>
-                  <Text style={styles.signatureLabel}>Transaction Hash</Text>
-                  <Text style={styles.signatureValue} numberOfLines={1}>
-                    {anchorResult.transactionHash}
-                  </Text>
-                  <Text style={[styles.signatureLabel, {marginTop: 8}]}>Block Number</Text>
-                  <Text style={styles.signatureValue}>
-                    {anchorResult.blockNumber}
-                  </Text>
-                  {ipfsResult && ipfsResult.cid && (
-                    <View style={{marginTop: 8}}>
-                      <Text style={styles.signatureLabel}>IPFS CID</Text>
-                      <Text style={styles.signatureValue} numberOfLines={1}>
-                        {ipfsResult.cid}
-                      </Text>
-                    </View>
-                  )}
-                </View>
-              )}
             </View>
-          ) : (
-            <View>
-              <Text style={[styles.infoText, {color: '#ef4444'}]}>
-                Anchoring failed. Check that the backend server is running.
+            <View style={styles.row}>
+              <Text style={styles.label}>Signatures</Text>
+              <Text style={styles.value}>{consentParties.signaturesReceived || 0}</Text>
+            </View>
+            {consentParties.consensusHash ? (
+              <View style={styles.row}>
+                <Text style={styles.label}>Consent Hash</Text>
+                <Text style={[styles.value, styles.mono]} numberOfLines={1}>
+                  {consentParties.consensusHash.substring(0, 16)}...
+                </Text>
+              </View>
+            ) : null}
+            <View style={styles.row}>
+              <Text style={styles.label}>Timestamp</Text>
+              <Text style={styles.value}>
+                {consentParties.consentTimestamp
+                  ? new Date(consentParties.consentTimestamp).toLocaleTimeString()
+                  : 'N/A'}
               </Text>
-              <TouchableOpacity
-                style={styles.anchorButton}
-                onPress={() => { setAnchorStatus(null); }}>
-                <Text style={styles.anchorButtonText}>Retry</Text>
-              </TouchableOpacity>
             </View>
-          )}
-        </View>
+          </View>
+        ) : null}
 
-        <View style={styles.actionsCard}>
-          <TouchableOpacity
-            style={styles.secondaryButton}
-            onPress={shareResults}>
-            <Text style={styles.secondaryButtonText}>📤 Share Results</Text>
+        {/* Actions */}
+        <View style={styles.actions}>
+          <TouchableOpacity style={styles.shareBtn} onPress={handleShare}>
+            <Text style={styles.shareBtnText}>📤 Share Proof</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={styles.secondaryButton}
+            style={styles.verifyBtn}
+            onPress={() => navigation.navigate('Verify', {captureId, watermarkedImageBase64})}>
+            <Text style={styles.verifyBtnText}>🔍 Verify This Capture</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.homeBtn}
             onPress={() => navigation.navigate('Home')}>
-            <Text style={styles.secondaryButtonText}>🏠 Return Home</Text>
+            <Text style={styles.homeBtnText}>← Back to Dashboard</Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
@@ -431,165 +326,105 @@ export default function ResultsScreen({navigation, route}) {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0f0f23',
-  },
-  header: {
-    flexDirection: 'row',
+  container: {flex: 1, backgroundColor: '#0f0f23'},
+  scroll: {padding: 20, paddingTop: 50, paddingBottom: 40},
+
+  statusBadge: {
     alignItems: 'center',
-    padding: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: '#1e1e3f',
-  },
-  backButton: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  backButtonText: {
-    color: '#ffffff',
-    fontSize: 28,
-  },
-  headerTitle: {
-    flex: 1,
-    color: '#ffffff',
-    fontSize: 20,
-    fontWeight: '600',
-    marginLeft: 8,
-  },
-  content: {
-    flex: 1,
-  },
-  successCard: {
-    margin: 16,
-    padding: 32,
-    backgroundColor: '#1a1a3e',
+    padding: 24,
     borderRadius: 16,
+    marginBottom: 20,
     borderWidth: 2,
-    borderColor: '#10b981',
+  },
+  verified: {
+    backgroundColor: 'rgba(0,255,136,0.08)',
+    borderColor: '#00ff88',
+  },
+  unverified: {
+    backgroundColor: 'rgba(255,152,0,0.08)',
+    borderColor: '#ff9800',
+  },
+  statusIcon: {fontSize: 48, marginBottom: 8},
+  statusTitle: {fontSize: 22, fontWeight: 'bold', marginBottom: 6},
+  verifiedText: {color: '#00ff88'},
+  unverifiedText: {color: '#ff9800'},
+  statusSubtitle: {color: '#8b8ba7', fontSize: 13, textAlign: 'center', lineHeight: 18},
+
+  captureIdBox: {
+    backgroundColor: 'rgba(99,102,241,0.1)',
+    borderRadius: 12,
+    padding: 16,
     alignItems: 'center',
-  },
-  successIcon: {
-    fontSize: 64,
-    color: '#10b981',
-    marginBottom: 16,
-  },
-  successTitle: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#ffffff',
-    marginBottom: 8,
-  },
-  successSubtitle: {
-    fontSize: 16,
-    color: '#8b8ba7',
-  },
-  card: {
-    margin: 16,
-    marginTop: 0,
-    padding: 20,
-    backgroundColor: '#1a1a3e',
-    borderRadius: 16,
+    marginBottom: 20,
     borderWidth: 1,
-    borderColor: '#2d2d5f',
+    borderColor: 'rgba(99,102,241,0.3)',
   },
-  cardTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#ffffff',
+  captureIdLabel: {color: '#8b8ba7', fontSize: 12, marginBottom: 4},
+  captureIdValue: {color: '#6366f1', fontSize: 20, fontWeight: 'bold', fontFamily: 'monospace'},
+  savedTag: {color: '#00ff88', fontSize: 11, marginTop: 6},
+
+  section: {
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderRadius: 12,
+    padding: 16,
     marginBottom: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
   },
-  metricRow: {
+  sectionTitle: {color: '#fff', fontSize: 16, fontWeight: 'bold', marginBottom: 4},
+  sectionDesc: {color: '#666', fontSize: 12, marginBottom: 12, lineHeight: 16},
+
+  row: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingVertical: 12,
+    paddingVertical: 8,
     borderBottomWidth: 1,
-    borderBottomColor: '#2d2d5f',
+    borderBottomColor: 'rgba(255,255,255,0.05)',
   },
-  metricLabel: {
-    fontSize: 14,
-    color: '#8b8ba7',
+  label: {color: '#8b8ba7', fontSize: 14},
+  value: {color: '#fff', fontSize: 14, fontWeight: '600'},
+  valueSmall: {color: '#8b8ba7', fontSize: 11, fontFamily: 'monospace', maxWidth: 180},
+  green: {color: '#00ff88'},
+  yellow: {color: '#ffc107'},
+  red: {color: '#ff4444'},
+
+  tag: {paddingHorizontal: 10, paddingVertical: 4, borderRadius: 8},
+  tagGreen: {backgroundColor: 'rgba(0,255,136,0.15)'},
+  tagOrange: {backgroundColor: 'rgba(255,165,0,0.15)'},
+  tagRed: {backgroundColor: 'rgba(255,68,68,0.15)'},
+  tagText: {color: '#fff', fontSize: 11, fontWeight: 'bold'},
+
+  hashBox: {
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    borderRadius: 8,
+    padding: 12,
   },
-  metricValue: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#ffffff',
-  },
-  successText: {
-    color: '#10b981',
-  },
-  signatureBlock: {
-    marginBottom: 16,
-  },
-  signatureLabel: {
-    fontSize: 12,
-    color: '#8b8ba7',
-    marginBottom: 4,
-  },
-  signatureValue: {
-    fontSize: 11,
-    fontFamily: 'monospace',
-    color: '#ffffff',
-    backgroundColor: '#0f0f23',
-    padding: 8,
-    borderRadius: 4,
-  },
-  infoText: {
-    fontSize: 14,
-    color: '#8b8ba7',
-    marginBottom: 16,
-    lineHeight: 20,
-  },
-  anchorButton: {
+  hashText: {color: '#6366f1', fontSize: 11, fontFamily: 'monospace', lineHeight: 16},
+
+  actions: {marginTop: 8},
+  shareBtn: {
     backgroundColor: '#6366f1',
     padding: 16,
     borderRadius: 12,
     alignItems: 'center',
-  },
-  anchorButtonDisabled: {
-    opacity: 0.6,
-  },
-  anchorButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  anchorSuccess: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: 16,
-    backgroundColor: '#10b981',
-    borderRadius: 12,
-  },
-  anchorSuccessIcon: {
-    fontSize: 24,
-    color: '#ffffff',
-    marginRight: 12,
-  },
-  anchorSuccessText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#ffffff',
-  },
-  actionsCard: {
-    margin: 16,
-    marginTop: 0,
-  },
-  secondaryButton: {
-    padding: 16,
-    borderRadius: 12,
-    backgroundColor: '#1a1a3e',
-    borderWidth: 1,
-    borderColor: '#2d2d5f',
     marginBottom: 12,
+  },
+  shareBtnText: {color: '#fff', fontSize: 16, fontWeight: 'bold'},
+  verifyBtn: {
+    backgroundColor: 'rgba(0,255,136,0.1)',
+    padding: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#00ff88',
+  },
+  verifyBtnText: {color: '#00ff88', fontSize: 16, fontWeight: 'bold'},
+  homeBtn: {
+    padding: 16,
+    borderRadius: 12,
     alignItems: 'center',
   },
-  secondaryButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
+  homeBtnText: {color: '#8b8ba7', fontSize: 14},
 });

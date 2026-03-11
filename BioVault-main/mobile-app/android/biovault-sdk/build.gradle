@@ -1,0 +1,67 @@
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+android {
+    namespace "com.biovault.sdk"
+
+    compileSdk rootProject.ext.compileSdkVersion
+    ndkVersion rootProject.ext.ndkVersion
+
+    defaultConfig {
+        minSdk rootProject.ext.minSdkVersion
+        targetSdk rootProject.ext.targetSdkVersion
+
+        consumerProguardFiles "consumer-rules.pro"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17 -frtti -fexceptions"
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
+
+        ndk {
+            abiFilters "arm64-v8a", "x86_64"
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    packagingOptions {
+        pickFirst 'lib/arm64-v8a/libc++_shared.so'
+        pickFirst 'lib/x86_64/libc++_shared.so'
+    }
+}
+
+dependencies {
+    implementation "androidx.appcompat:appcompat:1.6.1"
+    implementation "androidx.biometric:biometric:1.2.0-alpha05"
+    implementation 'com.google.mlkit:image-labeling:17.0.9'
+    implementation('org.pytorch:pytorch_android_lite:1.13.1') {
+        exclude group: 'com.facebook.fbjni'
+    }
+    implementation('org.pytorch:pytorch_android_torchvision_lite:1.13.1') {
+        exclude group: 'com.facebook.fbjni'
+    }
+    implementation 'com.facebook.fbjni:fbjni:0.5.1'
+}

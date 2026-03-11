@@ -109,6 +109,9 @@ dependencies {
     implementation "androidx.appcompat:appcompat:1.6.1"
     implementation "androidx.biometric:biometric:1.2.0-alpha05"
     
+    // ML Kit Image Labeling for content classification (Phase 3)
+    implementation 'com.google.mlkit:image-labeling:17.0.9'
+
     // PyTorch Mobile for neural network inference (using 1.13.1, latest stable)
     implementation('org.pytorch:pytorch_android_lite:1.13.1') {
         exclude group: 'com.facebook.fbjni'  // Use React Native's fbjni
@@ -121,8 +124,11 @@ dependencies {
     implementation 'com.facebook.fbjni:fbjni:0.5.1'
 }
 
-// Apply native modules if available
+// Apply native modules if available (check hoisted root node_modules too)
 def nativeModulesGradle = file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
+if (!nativeModulesGradle.exists()) {
+    nativeModulesGradle = file("../../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
+}
 if (!nativeModulesGradle.exists()) {
     nativeModulesGradle = file("../../node_modules/react-native/node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
 }

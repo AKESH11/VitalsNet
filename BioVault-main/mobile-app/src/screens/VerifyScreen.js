@@ -1,356 +1,339 @@
-import React, {useState} from 'react';
-import {View, Text, StyleSheet, TextInput, TouchableOpacity, Alert, ScrollView, ActivityIndicator, Clipboard} from 'react-native';
-import apiService from '../services/ApiService';
+import React, {useState, useEffect} from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TextInput,
+  TouchableOpacity,
+  ScrollView,
+  ActivityIndicator,
+  NativeModules,
+} from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-export default function VerifyScreen({navigation}) {
-  const [mediaHash, setMediaHash] = useState('');
-  const [isVerifying, setIsVerifying] = useState(false);
-  const [isZkpVerifying, setIsZkpVerifying] = useState(false);
+const {BioVaultModule} = NativeModules;
+const CAPTURES_KEY = 'biovault_captures';
+
+export default function VerifyScreen({route, navigation}) {
+  const [searchId, setSearchId] = useState(route.params?.captureId || '');
   const [result, setResult] = useState(null);
-  const [record, setRecord] = useState(null);
-  const [zkpResult, setZkpResult] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [notFound, setNotFound] = useState(false);
+  const [watermarkData, setWatermarkData] = useState(null);
+  const [wmExtracting, setWmExtracting] = useState(false);
 
-  const verify = async () => {
-    const trimmed = mediaHash.trim();
-    if (!trimmed) {
-      Alert.alert('Input Required', 'Enter or paste a media hash to verify.');
-      return;
+  useEffect(() => {
+    if (route.params?.captureId) {
+      handleVerify(route.params.captureId);
     }
-
-    // Basic input validation: hex hash should be 64 chars (SHA-256/BLAKE3)
-    // or 66 chars with 0x prefix
-    const cleaned = trimmed.startsWith('0x') ? trimmed.slice(2) : trimmed;
-    if (!/^[a-fA-F0-9]+$/.test(cleaned)) {
-      Alert.alert('Invalid Hash', 'The hash should be a hexadecimal string.');
-      return;
+    // Auto-extract watermark if image was passed
+    if (route.params?.watermarkedImageBase64) {
+      extractWatermark(route.params.watermarkedImageBase64);
     }
+  }, []);
 
-    setIsVerifying(true);
+  const handleVerify = async (id) => {
+    const lookupId = (id || searchId).trim().toUpperCase();
+    if (!lookupId) return;
+
+    setSearching(true);
     setResult(null);
-    setRecord(null);
-    setZkpResult(null);
+    setNotFound(false);
 
     try {
-      // Step 1: Quick verification check — uses smart fallback (backend → direct RPC)
-      const verifyResult = await apiService.smartVerifyMedia(trimmed);
-      setResult(verifyResult);
+      const raw = await AsyncStorage.getItem(CAPTURES_KEY);
+      const captures = raw ? JSON.parse(raw) : [];
+      const found = captures.find(c => c.captureId === lookupId);
 
-      // Step 2: If exists, fetch full record
-      if (verifyResult.exists) {
-        try {
-          const fullRecord = await apiService.smartGetMediaRecord(trimmed);
-          setRecord(fullRecord);
-        } catch (recordError) {
-          console.warn('Could not fetch full record:', recordError.message);
-        }
-      }
-    } catch (error) {
-      Alert.alert('Verification Error', error.message, [{text: 'OK'}]);
-    } finally {
-      setIsVerifying(false);
-    }
-  };
-
-  const verifyWithZKP = async () => {
-    if (!record || !record.bioSignature) {
-      Alert.alert('Not Available', 'No bio-signature found for ZKP verification.');
-      return;
-    }
-    setIsZkpVerifying(true);
-    setZkpResult(null);
-    try {
-      // Generate a ZK proof that the bio-signature matches without revealing it
-      const proofResult = await apiService.generateProof(
-        {
-          bioSignature: record.bioSignature,
-          mediaHash: mediaHash.trim(),
-          hardwareID: record.hardwareID || '',
-        },
-        'bio_match',
-      );
-
-      if (proofResult.proof) {
-        // Verify the generated proof
-        const verifyResult = await apiService.verifyProof(
-          proofResult.proof,
-          proofResult.publicSignals,
-          'verify',
-        );
-        setZkpResult({
-          proofGenerated: true,
-          verified: verifyResult.valid || verifyResult.verified,
-          proof: proofResult.proof,
-        });
+      if (found) {
+        setResult(found);
       } else {
-        setZkpResult({ proofGenerated: false, error: 'Proof generation failed' });
+        setNotFound(true);
       }
-    } catch (error) {
-      setZkpResult({ proofGenerated: false, error: error.message });
+    } catch (e) {
+      console.warn('Verify lookup error:', e);
+      setNotFound(true);
     } finally {
-      setIsZkpVerifying(false);
+      setSearching(false);
     }
   };
 
-  const copyToClipboard = (text, label) => {
-    if (Clipboard && Clipboard.setString) {
-      Clipboard.setString(text);
-      Alert.alert('Copied', `${label} copied to clipboard.`);
+  const extractWatermark = async (imageBase64) => {
+    if (!imageBase64 || !BioVaultModule?.extractWatermark) return;
+    setWmExtracting(true);
+    try {
+      const decoded = await BioVaultModule.extractWatermark(imageBase64);
+      if (decoded) {
+        const parsed = JSON.parse(decoded);
+        setWatermarkData(parsed);
+        console.log('[BioVault] Watermark extracted:', decoded);
+      } else {
+        setWatermarkData(null);
+      }
+    } catch (err) {
+      console.warn('[BioVault] Watermark extraction failed:', err.message);
+      setWatermarkData(null);
+    } finally {
+      setWmExtracting(false);
     }
-  };
-
-  const getStatusLabel = (status) => {
-    const labels = ['Pending', 'Verified', 'Disputed', 'Revoked'];
-    return labels[status] || `Unknown (${status})`;
-  };
-
-  const getStatusColor = (status) => {
-    const colors = ['#f59e0b', '#10b981', '#ef4444', '#6b7280'];
-    return colors[status] || '#8b8ba7';
   };
 
   return (
     <View style={styles.container}>
-      <View style={styles.header}>
-        <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
-          <Text style={styles.backButtonText}>&#x2190;</Text>
-        </TouchableOpacity>
-        <Text style={styles.headerTitle}>Verify Media</Text>
-      </View>
-
-      <ScrollView style={styles.content}>
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Enter Media Hash</Text>
-          <Text style={styles.description}>
-            Paste a media hash to check its authenticity on the Polygon blockchain.
+      <ScrollView contentContainerStyle={styles.scroll}>
+        {/* Header */}
+        <View style={styles.header}>
+          <Text style={styles.headerIcon}>🔍</Text>
+          <Text style={styles.headerTitle}>Verify Capture</Text>
+          <Text style={styles.headerDesc}>
+            Enter a BioVault Capture ID to verify its authenticity and origin
           </Text>
+        </View>
+
+        {/* Search */}
+        <View style={styles.searchBox}>
           <TextInput
             style={styles.input}
-            value={mediaHash}
-            onChangeText={setMediaHash}
-            placeholder="0x... or BLAKE3 hash"
-            placeholderTextColor="#4a4a6a"
-            autoCapitalize="none"
+            placeholder="BV-XXXXXXXXXXXX"
+            placeholderTextColor="#555"
+            value={searchId}
+            onChangeText={setSearchId}
+            autoCapitalize="characters"
             autoCorrect={false}
-            multiline={false}
           />
           <TouchableOpacity
-            style={[styles.verifyButton, isVerifying && styles.verifyButtonDisabled]}
-            onPress={verify}
-            disabled={isVerifying}>
-            {isVerifying ? (
-              <ActivityIndicator color="#ffffff" />
+            style={styles.searchBtn}
+            onPress={() => handleVerify()}
+            disabled={searching}>
+            {searching ? (
+              <ActivityIndicator color="#fff" size="small" />
             ) : (
-              <Text style={styles.verifyButtonText}>Verify on Blockchain</Text>
+              <Text style={styles.searchBtnText}>VERIFY</Text>
             )}
           </TouchableOpacity>
         </View>
 
+        {/* Result — Verified */}
         {result && (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Verification Result</Text>
-
-            <View style={styles.resultRow}>
-              <Text style={styles.resultLabel}>Found on Chain</Text>
-              <Text style={[styles.resultValue, {color: result.exists ? '#10b981' : '#ef4444'}]}>
-                {result.exists ? 'Yes' : 'No'}
+          <View style={styles.resultCard}>
+            <View style={[styles.resultBadge, result.originVerified ? styles.badgeGreen : styles.badgeOrange]}>
+              <Text style={styles.badgeIcon}>{result.originVerified ? '✅' : '⚠️'}</Text>
+              <Text style={[styles.badgeTitle, result.originVerified ? styles.greenText : styles.orangeText]}>
+                {result.originVerified ? 'ORIGIN VERIFIED' : 'ORIGIN UNVERIFIED'}
               </Text>
             </View>
 
-            {result.exists && (
-              <>
-                <View style={styles.resultRow}>
-                  <Text style={styles.resultLabel}>Valid</Text>
-                  <Text style={[styles.resultValue, {color: result.isValid ? '#10b981' : '#ef4444'}]}>
-                    {result.isValid ? 'Authentic' : 'Invalid'}
-                  </Text>
-                </View>
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Capture ID</Text>
+              <Text style={styles.detailValue}>{result.captureId}</Text>
+            </View>
 
-                <View style={styles.resultRow}>
-                  <Text style={styles.resultLabel}>Anchored At</Text>
-                  <Text style={styles.resultValue}>
-                    {result.date ? new Date(result.date).toLocaleString() : 'N/A'}
-                  </Text>
-                </View>
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Captured</Text>
+              <Text style={styles.detailValue}>
+                {new Date(result.timestamp).toLocaleString()}
+              </Text>
+            </View>
+
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Device Bound</Text>
+              <View style={[styles.miniTag, result.deviceFingerprint ? styles.miniGreen : styles.miniRed]}>
+                <Text style={styles.miniTagText}>{result.deviceFingerprint ? 'YES' : 'NO'}</Text>
+              </View>
+            </View>
+
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Bio-Signal</Text>
+              <Text style={styles.detailValue}>{result.bpm} BPM @ {result.confidence}%</Text>
+            </View>
+
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Duration</Text>
+              <Text style={styles.detailValue}>{result.duration}s</Text>
+            </View>
+
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Frames</Text>
+              <Text style={styles.detailValue}>{result.framesProcessed}</Text>
+            </View>
+
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Faces Detected</Text>
+              <Text style={styles.detailValue}>{result.facesDetected}</Text>
+            </View>
+
+            <View style={styles.hashSection}>
+              <Text style={styles.hashLabel}>Content Hash</Text>
+              <Text style={styles.hashValue} selectable>{result.contentHash}</Text>
+            </View>
+
+            <View style={styles.hashSection}>
+              <Text style={styles.hashLabel}>Device Fingerprint</Text>
+              <Text style={styles.hashValue} selectable>{result.deviceFingerprint || 'N/A'}</Text>
+            </View>
+          </View>
+        )}
+
+        {/* Not Found */}
+        {notFound && (
+          <View style={styles.notFoundCard}>
+            <Text style={styles.notFoundIcon}>❌</Text>
+            <Text style={styles.notFoundTitle}>NO RECORD FOUND</Text>
+            <Text style={styles.notFoundDesc}>
+              This Capture ID was not found in the local database.
+              The media was either not captured through BioVault or has been tampered with.
+            </Text>
+          </View>
+        )}
+
+        {/* Watermark Extraction */}
+        {(wmExtracting || watermarkData !== null) && (
+          <View style={styles.resultCard}>
+            <View style={[styles.resultBadge, watermarkData ? styles.badgeGreen : styles.badgeOrange]}>
+              <Text style={styles.badgeIcon}>{wmExtracting ? '⏳' : watermarkData ? '🔏' : '❌'}</Text>
+              <Text style={[styles.badgeTitle, watermarkData ? styles.greenText : styles.orangeText]}>
+                {wmExtracting ? 'EXTRACTING WATERMARK...' : watermarkData ? 'WATERMARK VERIFIED' : 'NO WATERMARK'}
+              </Text>
+            </View>
+            {watermarkData && (
+              <>
+                {watermarkData.bpm ? (
+                  <View style={styles.detailRow}>
+                    <Text style={styles.detailLabel}>Embedded BPM</Text>
+                    <Text style={styles.detailValue}>{watermarkData.bpm} BPM</Text>
+                  </View>
+                ) : null}
+                {watermarkData.dna ? (
+                  <View style={styles.detailRow}>
+                    <Text style={styles.detailLabel}>Device DNA (prefix)</Text>
+                    <Text style={styles.detailValue}>{watermarkData.dna}</Text>
+                  </View>
+                ) : null}
+                {watermarkData.ts ? (
+                  <View style={styles.detailRow}>
+                    <Text style={styles.detailLabel}>Captured At</Text>
+                    <Text style={styles.detailValue}>{new Date(watermarkData.ts * 1000).toLocaleString()}</Text>
+                  </View>
+                ) : null}
+                {watermarkData.id ? (
+                  <View style={styles.detailRow}>
+                    <Text style={styles.detailLabel}>Watermark ID</Text>
+                    <Text style={styles.detailValue}>{watermarkData.id}</Text>
+                  </View>
+                ) : null}
               </>
             )}
-
-            {!result.exists && (
-              <Text style={styles.notFoundText}>
-                This media hash was not found on the Polygon Amoy blockchain. 
-                It may not have been anchored, or the hash may be incorrect.
-              </Text>
-            )}
           </View>
         )}
 
-        {record && (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Provenance Record</Text>
-
-            <View style={styles.resultRow}>
-              <Text style={styles.resultLabel}>Status</Text>
-              <Text style={[styles.resultValue, {color: getStatusColor(record.status)}]}>
-                {getStatusLabel(record.status)}
-              </Text>
-            </View>
-
-            <View style={styles.resultRow}>
-              <Text style={styles.resultLabel}>Creator</Text>
-              <Text style={styles.resultValueMono} numberOfLines={1}>{record.creator}</Text>
-            </View>
-
-            <View style={styles.resultRow}>
-              <Text style={styles.resultLabel}>Bio-Signature</Text>
-              <Text style={styles.resultValueMono} numberOfLines={1}>{record.bioSignature}</Text>
-            </View>
-
-            <View style={styles.resultRow}>
-              <Text style={styles.resultLabel}>Hardware ID</Text>
-              <Text style={styles.resultValueMono} numberOfLines={1}>{record.hardwareID}</Text>
-            </View>
-
-            <View style={styles.resultRow}>
-              <Text style={styles.resultLabel}>Faces Detected</Text>
-              <Text style={styles.resultValue}>{record.detectedFaces || 'N/A'}</Text>
-            </View>
-
-            <View style={styles.resultRow}>
-              <Text style={styles.resultLabel}>Unique Signals</Text>
-              <Text style={[styles.resultValue, {color: record.allUniqueSignals ? '#10b981' : '#f59e0b'}]}>
-                {record.allUniqueSignals ? 'Yes' : 'No'}
-              </Text>
-            </View>
-
-            {record.ipfsHash ? (
-              <View style={styles.resultRow}>
-                <Text style={styles.resultLabel}>IPFS</Text>
-                <Text style={styles.resultValueMono} numberOfLines={1}>{record.ipfsHash}</Text>
-              </View>
-            ) : null}
-
-            {record.proofOfRealityHash ? (
-              <View style={styles.resultRow}>
-                <Text style={styles.resultLabel}>Reality Hash</Text>
-                <Text style={styles.resultValueMono} numberOfLines={1}>{record.proofOfRealityHash}</Text>
-              </View>
-            ) : null}
-
-            {record.consensusParties && record.consensusParties.length > 0 && (
-              <View style={{marginTop: 12}}>
-                <Text style={styles.resultLabel}>Consensus Parties ({record.consensusParties.length})</Text>
-                {record.consensusParties.map((addr, i) => (
-                  <Text key={i} style={[styles.resultValueMono, {marginTop: 4}]} numberOfLines={1}>
-                    {addr}
-                  </Text>
-                ))}
-              </View>
-            )}
-
-            {record.isRevoked && (
-              <View style={styles.revokedBanner}>
-                <Text style={styles.revokedText}>This media has been revoked by its creator</Text>
-              </View>
-            )}
-
-            {/* Copy hash to clipboard */}
-            <TouchableOpacity
-              style={[styles.verifyButton, {marginTop: 16, backgroundColor: '#1e1e3f'}]}
-              onPress={() => copyToClipboard(mediaHash.trim(), 'Media Hash')}>
-              <Text style={[styles.verifyButtonText, {color: '#6366f1'}]}>Copy Hash</Text>
-            </TouchableOpacity>
-          </View>
-        )}
-
-        {/* ZKP Verification */}
-        {record && record.bioSignature && (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Zero-Knowledge Proof</Text>
-            <Text style={styles.description}>
-              Verify the bio-signature cryptographically without revealing sensitive biometric data.
-            </Text>
-
-            <TouchableOpacity
-              style={[styles.verifyButton, isZkpVerifying && styles.verifyButtonDisabled, {backgroundColor: '#8b5cf6'}]}
-              onPress={verifyWithZKP}
-              disabled={isZkpVerifying}>
-              {isZkpVerifying ? (
-                <ActivityIndicator color="#ffffff" />
-              ) : (
-                <Text style={styles.verifyButtonText}>Verify with ZKP</Text>
-              )}
-            </TouchableOpacity>
-
-            {zkpResult && (
-              <View style={{marginTop: 16}}>
-                <View style={styles.resultRow}>
-                  <Text style={styles.resultLabel}>Proof Generated</Text>
-                  <Text style={[styles.resultValue, {color: zkpResult.proofGenerated ? '#10b981' : '#ef4444'}]}>
-                    {zkpResult.proofGenerated ? 'Yes' : 'No'}
-                  </Text>
-                </View>
-                {zkpResult.proofGenerated && (
-                  <View style={styles.resultRow}>
-                    <Text style={styles.resultLabel}>ZKP Verified</Text>
-                    <Text style={[styles.resultValue, {color: zkpResult.verified ? '#10b981' : '#ef4444'}]}>
-                      {zkpResult.verified ? 'Valid' : 'Invalid'}
-                    </Text>
-                  </View>
-                )}
-                {zkpResult.error && (
-                  <Text style={[styles.description, {color: '#ef4444', marginTop: 8}]}>
-                    {zkpResult.error}
-                  </Text>
-                )}
-              </View>
-            )}
-          </View>
-        )}
+        {/* Back */}
+        <TouchableOpacity
+          style={styles.backBtn}
+          onPress={() => navigation.navigate('Home')}>
+          <Text style={styles.backBtnText}>← Back to Dashboard</Text>
+        </TouchableOpacity>
       </ScrollView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0f0f23' },
-  header: {
-    flexDirection: 'row', alignItems: 'center', padding: 16,
-    borderBottomWidth: 1, borderBottomColor: '#1e1e3f',
+  container: {flex: 1, backgroundColor: '#0f0f23'},
+  scroll: {padding: 20, paddingTop: 50, paddingBottom: 40},
+
+  header: {alignItems: 'center', marginBottom: 24},
+  headerIcon: {fontSize: 48, marginBottom: 8},
+  headerTitle: {color: '#fff', fontSize: 24, fontWeight: 'bold', marginBottom: 6},
+  headerDesc: {color: '#8b8ba7', fontSize: 13, textAlign: 'center', lineHeight: 18},
+
+  searchBox: {
+    flexDirection: 'row',
+    marginBottom: 24,
   },
-  backButton: { width: 40, height: 40, justifyContent: 'center', alignItems: 'center' },
-  backButtonText: { color: '#ffffff', fontSize: 28 },
-  headerTitle: { flex: 1, color: '#ffffff', fontSize: 20, fontWeight: '600', marginLeft: 8 },
-  content: { flex: 1 },
-  card: {
-    margin: 16, marginBottom: 0, padding: 20, backgroundColor: '#1a1a3e',
-    borderRadius: 16, borderWidth: 1, borderColor: '#2d2d5f',
-  },
-  cardTitle: { fontSize: 18, fontWeight: '600', color: '#ffffff', marginBottom: 12 },
-  description: { fontSize: 14, color: '#8b8ba7', marginBottom: 16, lineHeight: 20 },
   input: {
-    backgroundColor: '#0f0f23', borderWidth: 1, borderColor: '#2d2d5f', borderRadius: 8,
-    padding: 14, color: '#ffffff', fontFamily: 'monospace', fontSize: 13, marginBottom: 16,
+    flex: 1,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.15)',
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    color: '#fff',
+    fontSize: 16,
+    fontFamily: 'monospace',
+    marginRight: 10,
   },
-  verifyButton: {
-    backgroundColor: '#6366f1', padding: 16, borderRadius: 12, alignItems: 'center',
+  searchBtn: {
+    backgroundColor: '#6366f1',
+    paddingHorizontal: 20,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
-  verifyButtonDisabled: { opacity: 0.6 },
-  verifyButtonText: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
-  resultRow: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#2d2d5f',
+  searchBtnText: {color: '#fff', fontSize: 14, fontWeight: 'bold'},
+
+  resultCard: {
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
   },
-  resultLabel: { fontSize: 13, color: '#8b8ba7' },
-  resultValue: { fontSize: 14, fontWeight: '600', color: '#ffffff' },
-  resultValueMono: {
-    fontSize: 11, fontFamily: 'monospace', color: '#ffffff', flex: 1,
-    textAlign: 'right', marginLeft: 12,
+  resultBadge: {
+    alignItems: 'center',
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 16,
   },
-  notFoundText: {
-    fontSize: 14, color: '#8b8ba7', marginTop: 12, lineHeight: 20,
+  badgeGreen: {backgroundColor: 'rgba(0,255,136,0.1)'},
+  badgeOrange: {backgroundColor: 'rgba(255,152,0,0.1)'},
+  badgeIcon: {fontSize: 36, marginBottom: 6},
+  badgeTitle: {fontSize: 18, fontWeight: 'bold'},
+  greenText: {color: '#00ff88'},
+  orangeText: {color: '#ff9800'},
+
+  detailRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.05)',
   },
-  revokedBanner: {
-    marginTop: 16, padding: 12, backgroundColor: '#ef444420', borderRadius: 8,
-    borderWidth: 1, borderColor: '#ef4444',
+  detailLabel: {color: '#8b8ba7', fontSize: 14},
+  detailValue: {color: '#fff', fontSize: 14, fontWeight: '600'},
+
+  miniTag: {paddingHorizontal: 10, paddingVertical: 3, borderRadius: 6},
+  miniGreen: {backgroundColor: 'rgba(0,255,136,0.15)'},
+  miniRed: {backgroundColor: 'rgba(255,68,68,0.15)'},
+  miniTagText: {color: '#fff', fontSize: 11, fontWeight: 'bold'},
+
+  hashSection: {marginTop: 12},
+  hashLabel: {color: '#8b8ba7', fontSize: 12, marginBottom: 4},
+  hashValue: {
+    color: '#6366f1',
+    fontSize: 10,
+    fontFamily: 'monospace',
+    lineHeight: 14,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    padding: 10,
+    borderRadius: 8,
   },
-  revokedText: { color: '#ef4444', fontSize: 14, fontWeight: '600', textAlign: 'center' },
+
+  notFoundCard: {
+    backgroundColor: 'rgba(255,68,68,0.06)',
+    borderRadius: 16,
+    padding: 24,
+    alignItems: 'center',
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(255,68,68,0.2)',
+  },
+  notFoundIcon: {fontSize: 48, marginBottom: 8},
+  notFoundTitle: {color: '#ff4444', fontSize: 20, fontWeight: 'bold', marginBottom: 8},
+  notFoundDesc: {color: '#8b8ba7', fontSize: 13, textAlign: 'center', lineHeight: 18},
+
+  backBtn: {padding: 16, alignItems: 'center'},
+  backBtnText: {color: '#8b8ba7', fontSize: 14},
 });

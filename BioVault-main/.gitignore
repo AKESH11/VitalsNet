@@ -20,7 +20,6 @@ dist/
 # Environment files
 .env
 .env.local
-.env.amoy
 .env.production
 *.key
 *.pem
@@ -41,11 +40,16 @@ desktop.ini
 *.log
 logs/
 
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+
 # ZKP artifacts (large files)
-powersOfTau28_hez_final_14.ptau
-verify_0000.zkey
-verify_final.zkey
-zkp-circuits/build/
+*.ptau
 
 # Android
 *.apk
@@ -70,24 +74,15 @@ Pods/
 mobile-app/ios/build/
 mobile-app/ios/Pods/
 
-# Smart Contracts
-smart-contracts/artifacts/
-smart-contracts/cache/
-smart-contracts/typechain-types/
-coverage/
-coverage.json
-
 # C++ build
 CMakeCache.txt
 CMakeFiles/
+cmake_install.cmake
 
 # Test outputs
 .nyc_output/
-
-# CMake
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
+coverage/
+coverage.json
 
 # Keys (NEVER commit private keys)
 *.key
@@ -98,3 +93,7 @@ secrets/
 *.keystore
 !mobile-app/android/app/debug.keystore
 keystore.properties
+
+# FastAPI / Backend
+*.db
+*.sqlite3
