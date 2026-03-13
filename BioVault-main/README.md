@@ -1,62 +1,67 @@
 ﻿# VitalsNet
 
-Minimal, production-oriented mobile stack for proof-of-capture and authenticity signals.
+Proof of Human Capture.
 
-VitalsNet combines biometric liveness, device fingerprinting, watermarking, consent-aware capture flow, and privacy alerts in a single Android-first React Native app.
+VitalsNet is an Android-first React Native app that combines capture-time authenticity, bio-signal extraction, watermark verification, BLE consent, and Privacy Shield alerts in one minimal workflow.
 
-## What this project does
+## Product highlights
 
-- Captures media with capture-time authenticity signals.
-- Extracts heartbeat and liveness features (rPPG/TS-CAN path).
-- Generates device-linked fingerprint signals (PRNU/hardware DNA path).
-- Embeds and verifies watermark metadata for media integrity flow.
-- Computes a Reality Score from multiple weighted signals.
-- Supports BLE consent workflow for sensitive captures.
-- Supports Privacy Shield mode to detect/report unconsented nearby captures.
-- Syncs capture records and privacy alerts through Firestore REST APIs.
+- Capture with device-bound authenticity signals
+- rPPG/TS-CAN heartbeat and liveness signal path
+- Watermark embed and extract verification path
+- Reality Score with transparent component breakdown
+- BLE consent handshake for sensitive content
+- Privacy Shield for nearby unconsented capture detection
+- Firestore REST sync for captures and privacy alerts
 
-## Core capabilities
+## Demo UI (actual app screens)
 
-### 1) Capture and scoring
-- Camera session + native processing pipeline.
-- Weighted Reality Score composition (heartbeat, device, consent, watermark, etc.).
-- Result screen with score breakdown and evidence fields.
+### Home dashboard
+![Home Dashboard](./docs/images/01-home.jpeg)
 
-### 2) Verify flow
-- Verify media/capture IDs across devices.
-- Watermark extraction path with user-facing verification output.
+### Live camera recording
+![Camera Recording](./docs/images/02-camera-recording.jpeg)
 
-### 3) Privacy Shield
-- Broadcasts short VitalsID over BLE via foreground service.
-- Nearby capture-side scan to detect unconsented subjects.
-- Uploads violations to Firestore and renders alert timeline on device.
+### Consent wait overlay (capture side)
+![Consent Waiting](./docs/images/03-consent-waiting.jpeg)
 
-## High-level architecture
+### Verify capture and watermark evidence
+![Verify Capture](./docs/images/04-verify-capture.jpeg)
 
-- React Native UI and navigation: screens, app state, user flows.
-- Android native bridge (`BioVaultModule`) for camera/SDK/BLE/service operations.
-- Native SDK layer (`biovault-sdk`) for capture, scoring, inference, and consent broadcaster.
-- C++ layer for performance-sensitive signal and crypto operations.
-- Firebase REST service layer for capture and privacy alert persistence.
+### Consent request overlay (nearby device side)
+![Consent Requested](./docs/images/05-consent-requested.jpeg)
 
-## Repository layout
+## End-to-end flow
+
+1. User records media in VitalsNet camera.
+2. Native pipeline computes bio/device/authenticity signals.
+3. If content is sensitive, BLE consent is requested and validated.
+4. Capture metadata and proof are persisted and can be verified by Capture ID.
+5. Privacy Shield can broadcast VitalsID and receive violation alerts.
+
+## Architecture (high level)
+
+- React Native app and screens: user flow, capture UX, verification UX
+- Android native bridge: camera + BLE + service operations (`BioVaultModule`)
+- Native SDK (`biovault-sdk`): scoring, inference, consent broadcaster
+- C++ modules: performance-critical signal/crypto path
+- Firebase REST service layer: captures + privacy alerts
+
+## Repository structure
 
 ```text
 BioVault-main/
-	mobile-app/
-		src/
-			screens/            # Login, Calibration, Home, Camera, Results, Verify, PrivacyShield
-			components/         # Shared UI + error boundary
-			services/           # Firebase REST integration
-		android/
-			app/
-				src/main/java/com/biovault/   # RN bridge + foreground service
-			biovault-sdk/
-				src/main/java/com/biovault/sdk/  # capture/scoring/inference/consent
-				src/main/cpp/                     # native cmake entry
-		cpp/                    # Native C++ modules
-	scripts/                  # Build/support scripts
-	third_party/              # External native dependencies
+  mobile-app/
+    src/
+      screens/
+      components/
+      services/
+    android/
+      app/src/main/java/com/biovault/
+      biovault-sdk/src/main/java/com/biovault/sdk/
+      biovault-sdk/src/main/cpp/
+    cpp/
+  docs/images/
 ```
 
 ## Quick start
@@ -64,17 +69,17 @@ BioVault-main/
 ### Prerequisites
 - Node.js >= 18
 - npm >= 9
-- Android Studio + SDK/NDK configured
-- ADB device/emulator available
+- Android Studio with SDK/NDK
+- ADB-enabled device or emulator
 
-### Install
+### Install dependencies
 
 ```bash
 npm install
 npm run install:mobile
 ```
 
-### Build native C++ (optional but recommended before Android run)
+### Build native modules
 
 ```bash
 npm run build:cpp
@@ -86,21 +91,11 @@ npm run build:cpp
 npm run mobile:android
 ```
 
-## Screenshots
-
-Home
-
-![VitalsNet Home](./screen1.png)
-
-Capture / App flow
-
-![VitalsNet App Screen](./screen2.png)
-
 ## Notes
 
-- The app currently targets Android-first workflow.
-- Firebase is integrated via REST calls in service layer.
-- BLE and foreground-service permissions are required for Privacy Shield features.
+- Android-first implementation
+- Firebase integration uses REST APIs
+- BLE + foreground service permissions are required for Privacy Shield features
 
 ## License
 
