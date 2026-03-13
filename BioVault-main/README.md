@@ -17,19 +17,19 @@ VitalsNet is an Android-first React Native app that combines capture-time authen
 ## Demo UI (actual app screens)
 
 ### Home dashboard
-![Home Dashboard](./BioVault-main/docs/images/01-home.jpeg)
+![Home Dashboard](./docs/images/01-home.jpeg)
 
 ### Live camera recording
-![Camera Recording](./BioVault-main/docs/images/02-camera-recording.jpeg)
+![Camera Recording](./docs/images/02-camera-recording.jpeg)
 
 ### Consent wait overlay (capture side)
-![Consent Waiting](./BioVault-main/docs/images/03-consent-waiting.jpeg)
-
-### Consent request overlay (nearby device side)
-![Consent Requested](./BioVault-main/docs/images/05-consent-requested.jpeg)
+![Consent Waiting](./docs/images/03-consent-waiting.jpeg)
 
 ### Verify capture and watermark evidence
-![Verify Capture](./BioVault-main/docs/images/04-verify-capture.jpeg)
+![Verify Capture](./docs/images/04-verify-capture.jpeg)
+
+### Consent request overlay (nearby device side)
+![Consent Requested](./docs/images/05-consent-requested.jpeg)
 
 ## End-to-end flow
 
