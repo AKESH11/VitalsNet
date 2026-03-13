@@ -1,85 +1,106 @@
-﻿# BioVault 2.0
+﻿# VitalsNet
 
-**Unified Physiological-Cryptographic Infrastructure for IT Amendment Rules 2026 Compliance**
+Minimal, production-oriented mobile stack for proof-of-capture and authenticity signals.
 
-BioVault 2.0 is a Compliance-as-a-Service (CaaS) platform that combines real-time rPPG biometric extraction, DWT-SVD invisible watermarking, and forensic deepfake detection â€” built for India's IT Amendment Rules 2026.
+VitalsNet combines biometric liveness, device fingerprinting, watermarking, consent-aware capture flow, and privacy alerts in a single Android-first React Native app.
 
-[![Platform](https://img.shields.io/badge/platform-Android-green)]()
-[![Backend](https://img.shields.io/badge/backend-FastAPI%20%2B%20C++-blue)]()
-[![Blockchain](https://img.shields.io/badge/blockchain-Hyperledger%20Besu-orange)]()
-[![License](https://img.shields.io/badge/license-MIT-blue)]()
+## What this project does
 
-## Architecture
+- Captures media with capture-time authenticity signals.
+- Extracts heartbeat and liveness features (rPPG/TS-CAN path).
+- Generates device-linked fingerprint signals (PRNU/hardware DNA path).
+- Embeds and verifies watermark metadata for media integrity flow.
+- Computes a Reality Score from multiple weighted signals.
+- Supports BLE consent workflow for sensitive captures.
+- Supports Privacy Shield mode to detect/report unconsented nearby captures.
+- Syncs capture records and privacy alerts through Firestore REST APIs.
 
-### Lane A â€” Proactive (Capture-Time)
-1. **rPPG Extraction** â€” POS algorithm extracts 128-bit Physiological Seed from facial video
-2. **DWT-SVD Watermarking** â€” Embeds seed as invisible watermark that survives WhatsApp compression
-3. **Blockchain Anchor** â€” Hyperledger Besu private L2 for tamper-proof timestamping
+## Core capabilities
 
-### Lane B â€” Reactive (Forensic Analysis)
-1. **Pixel-Artifact Scan** â€” Detects GAN/diffusion artifacts and compression anomalies
-2. **Geometric Consistency** â€” Validates facial geometry and lighting coherence
-3. **Source Provenance** â€” PRNU camera sensor fingerprinting
+### 1) Capture and scoring
+- Camera session + native processing pipeline.
+- Weighted Reality Score composition (heartbeat, device, consent, watermark, etc.).
+- Result screen with score breakdown and evidence fields.
 
-### IT Rules 2026 Compliance
-- 120-minute takedown SLA
-- SGI (Synthetic/Generated/Inauthentic) labeling
-- SIM-binding for creator identity
-- DPDP Act data protection compliance
+### 2) Verify flow
+- Verify media/capture IDs across devices.
+- Watermark extraction path with user-facing verification output.
 
-## Tech Stack
+### 3) Privacy Shield
+- Broadcasts short VitalsID over BLE via foreground service.
+- Nearby capture-side scan to detect unconsented subjects.
+- Uploads violations to Firestore and renders alert timeline on device.
 
-| Layer | Technology |
-|-------|-----------|
-| Mobile | React Native 0.73 + C++ NDK |
-| Vision | MediaPipe BlazeFace, TFLite |
-| rPPG | POS Algorithm (C++) |
-| Watermark | DWT-SVD (C++) |
-| Forensics | PRNU + Pixel Analysis (C++/Python) |
-| Backend | FastAPI (Python) |
-| Blockchain | Hyperledger Besu (Private L2) |
-| ZKP | Zero-Knowledge Humanity Tokens |
-| Camera | OpenCV 4.10 Android SDK |
+## High-level architecture
 
-## Project Structure
+- React Native UI and navigation: screens, app state, user flows.
+- Android native bridge (`BioVaultModule`) for camera/SDK/BLE/service operations.
+- Native SDK layer (`biovault-sdk`) for capture, scoring, inference, and consent broadcaster.
+- C++ layer for performance-sensitive signal and crypto operations.
+- Firebase REST service layer for capture and privacy alert persistence.
 
-```
+## Repository layout
+
+```text
 BioVault-main/
-â”œâ”€â”€ mobile-app/           # React Native + C++ native modules
-â”‚   â”œâ”€â”€ android/          # Android build (AGP 8.7, Gradle 8.9)
-â”‚   â”œâ”€â”€ cpp/              # C++ native: rPPG, PRNU, crypto
-â”‚   â”‚   â”œâ”€â”€ include/      # Headers
-â”‚   â”‚   â”œâ”€â”€ src/          # Implementation
-â”‚   â”‚   â””â”€â”€ test/         # C++ unit tests
-â”‚   â”œâ”€â”€ src/
-â”‚   â”‚   â”œâ”€â”€ components/   # Camera view, error boundary
-â”‚   â”‚   â”œâ”€â”€ config/       # App configuration
-â”‚   â”‚   â”œâ”€â”€ screens/      # UI screens
-â”‚   â”‚   â””â”€â”€ services/     # API + business logic
-â”‚   â””â”€â”€ third-party/      # libsodium
-â”œâ”€â”€ scripts/              # Build scripts (libsodium)
-â”œâ”€â”€ third_party/          # OpenCV Android SDK
-â””â”€â”€ package.json          # Workspace root
+	mobile-app/
+		src/
+			screens/            # Login, Calibration, Home, Camera, Results, Verify, PrivacyShield
+			components/         # Shared UI + error boundary
+			services/           # Firebase REST integration
+		android/
+			app/
+				src/main/java/com/biovault/   # RN bridge + foreground service
+			biovault-sdk/
+				src/main/java/com/biovault/sdk/  # capture/scoring/inference/consent
+				src/main/cpp/                     # native cmake entry
+		cpp/                    # Native C++ modules
+	scripts/                  # Build/support scripts
+	third_party/              # External native dependencies
 ```
 
-## Quick Start
+## Quick start
+
+### Prerequisites
+- Node.js >= 18
+- npm >= 9
+- Android Studio + SDK/NDK configured
+- ADB device/emulator available
+
+### Install
 
 ```bash
-# Install dependencies
-cd mobile-app && npm install
-
-# Build C++ native modules
-npm run build:cpp
-
-# Run on Android device
-npm run android
+npm install
+npm run install:mobile
 ```
 
-## Red-Team Defenses
-- 50 Hz light-noise cancellation (anti-screen replay)
-- Synthetic pulse rejection (anti-deepfake video)
-- ZKP humanity tokens (prove liveness without revealing biometrics)
-- Multi-frame temporal consistency validation
+### Build native C++ (optional but recommended before Android run)
+
+```bash
+npm run build:cpp
+```
+
+### Run Android app
+
+```bash
+npm run mobile:android
+```
+
+## Screenshots
+
+Home
+
+![VitalsNet Home](./screen1.png)
+
+Capture / App flow
+
+![VitalsNet App Screen](./screen2.png)
+
+## Notes
+
+- The app currently targets Android-first workflow.
+- Firebase is integrated via REST calls in service layer.
+- BLE and foreground-service permissions are required for Privacy Shield features.
 
 ## License
 
