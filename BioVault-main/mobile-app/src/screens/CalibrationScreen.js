@@ -44,7 +44,7 @@ export default function CalibrationScreen({navigation}) {
           PermissionsAndroid.PERMISSIONS.CAMERA,
           {
             title: 'Camera Permission',
-            message: 'BioVault needs camera access to calibrate your Device DNA fingerprint.',
+            message: 'VitalsNet needs camera access to calibrate your Device DNA fingerprint.',
             buttonPositive: 'Allow',
           },
         );
@@ -66,15 +66,15 @@ export default function CalibrationScreen({navigation}) {
       // Initialize BioVault core engine (PRNU extractor lives here)
       if (BioVaultModule && BioVaultModule.init) {
         const initResult = await BioVaultModule.init();
-        console.log('[BioVault] Core engine initialized:', initResult);
+        console.log('[VitalsNet] Core engine initialized:', initResult);
       }
       // Initialize camera bridge
       if (BioVaultModule && BioVaultModule.initializeCamera) {
         await BioVaultModule.initializeCamera('');
-        console.log('[BioVault] Camera initialized for calibration');
+        console.log('[VitalsNet] Camera initialized for calibration');
       }
     } catch (e) {
-      console.error('[BioVault] Init error:', e);
+      console.error('[VitalsNet] Init error:', e);
     }
   };
 
@@ -92,7 +92,7 @@ export default function CalibrationScreen({navigation}) {
 
         try {
           const resultJson = await BioVaultModule.finalizeCalibration();
-          console.log('[BioVault] Calibration result:', resultJson);
+          console.log('[VitalsNet] Calibration result:', resultJson);
 
           const result = JSON.parse(resultJson);
           if (result.success && result.hardwareFingerprint) {
@@ -121,7 +121,7 @@ export default function CalibrationScreen({navigation}) {
             );
           }
         } catch (e) {
-          console.error('[BioVault] Finalize error:', e);
+          console.error('[VitalsNet] Finalize error:', e);
           setStatus('error');
           Alert.alert('Calibration Error', e.message, [
             {text: 'Retry', onPress: () => retryCalibration()},
@@ -147,7 +147,6 @@ export default function CalibrationScreen({navigation}) {
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.emoji}>🧬</Text>
         <Text style={styles.title}>Device DNA Calibration</Text>
         <Text style={styles.subtitle}>
           {status === 'requesting_permission'
@@ -172,7 +171,6 @@ export default function CalibrationScreen({navigation}) {
           />
         ) : status === 'complete' ? (
           <View style={styles.dnaDisplay}>
-            <Text style={styles.dnaIcon}>✅</Text>
             <Text style={styles.dnaLabel}>Device DNA</Text>
             <Text style={styles.dnaHash}>
               {fingerprint ? fingerprint.substring(0, 32) + '...' : ''}
@@ -212,12 +210,12 @@ export default function CalibrationScreen({navigation}) {
         <Text style={styles.infoTitle}>What is Device DNA?</Text>
         <Text style={styles.infoText}>
           Every camera sensor has a unique noise pattern called PRNU
-          (Photo-Response Non-Uniformity). BioVault extracts this pattern to
+          (Photo-Response Non-Uniformity). VitalsNet extracts this pattern to
           create an unforgeable fingerprint that binds every capture to YOUR
           specific device.
         </Text>
         <Text style={styles.infoDetail}>
-          📸 50 frames → noise extraction → Wiener filter → BLAKE3 hash
+          50 frames → noise extraction → Wiener filter → BLAKE3 hash
         </Text>
       </View>
     </View>
@@ -227,34 +225,30 @@ export default function CalibrationScreen({navigation}) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#0f0f23',
+    backgroundColor: '#09090b',
     padding: 20,
   },
   header: {
     alignItems: 'center',
-    marginTop: 30,
-    marginBottom: 16,
-  },
-  emoji: {
-    fontSize: 40,
-    marginBottom: 8,
+    marginTop: 40,
+    marginBottom: 20,
   },
   title: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#ffffff',
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#fafafa',
     marginBottom: 6,
   },
   subtitle: {
     fontSize: 14,
-    color: '#8b8ba7',
+    color: '#71717a',
     textAlign: 'center',
   },
   cameraContainer: {
     height: 260,
-    borderRadius: 16,
+    borderRadius: 12,
     overflow: 'hidden',
-    backgroundColor: '#1a1a3e',
+    backgroundColor: '#18181b',
     marginBottom: 20,
   },
   camera: {
@@ -266,28 +260,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   placeholderText: {
-    color: '#555',
+    color: '#52525b',
     fontSize: 14,
   },
   dnaDisplay: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: '#0a2a1a',
-  },
-  dnaIcon: {
-    fontSize: 48,
-    marginBottom: 12,
+    backgroundColor: '#18181b',
   },
   dnaLabel: {
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: '600',
-    color: '#00ff88',
+    color: '#22c55e',
     marginBottom: 8,
   },
   dnaHash: {
     fontSize: 12,
-    color: '#6366f1',
+    color: '#a1a1aa',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     paddingHorizontal: 20,
     textAlign: 'center',
@@ -296,45 +286,45 @@ const styles = StyleSheet.create({
     marginBottom: 24,
   },
   progressBar: {
-    height: 8,
-    backgroundColor: '#1a1a3e',
-    borderRadius: 4,
+    height: 4,
+    backgroundColor: '#18181b',
+    borderRadius: 2,
     overflow: 'hidden',
     marginBottom: 8,
   },
   progressFill: {
     height: '100%',
-    backgroundColor: '#6366f1',
-    borderRadius: 4,
+    backgroundColor: '#a1a1aa',
+    borderRadius: 2,
   },
   progressComplete: {
-    backgroundColor: '#00ff88',
+    backgroundColor: '#22c55e',
   },
   progressText: {
-    color: '#8b8ba7',
+    color: '#71717a',
     fontSize: 13,
     textAlign: 'center',
   },
   infoSection: {
-    backgroundColor: '#1a1a3e',
+    backgroundColor: '#18181b',
     borderRadius: 12,
     padding: 16,
   },
   infoTitle: {
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '600',
-    color: '#ffffff',
+    color: '#fafafa',
     marginBottom: 8,
   },
   infoText: {
     fontSize: 13,
-    color: '#8b8ba7',
+    color: '#71717a',
     lineHeight: 20,
     marginBottom: 8,
   },
   infoDetail: {
     fontSize: 12,
-    color: '#6366f1',
+    color: '#52525b',
     fontStyle: 'italic',
   },
 });

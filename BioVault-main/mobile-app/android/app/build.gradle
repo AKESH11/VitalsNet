@@ -19,23 +19,8 @@ android {
         // React Native Camera defines product flavors; pick one explicitly to satisfy variant selection.
         missingDimensionStrategy 'react-native-camera', 'general'
 
-        // Native build with OpenCV SDK
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++17 -frtti -fexceptions"
-                arguments "-DANDROID_STL=c++_shared"
-            }
-        }
-
         ndk {
             abiFilters "arm64-v8a", "x86_64"
-        }
-    }
-
-    // Native build with CMake
-    externalNativeBuild {
-        cmake {
-            path "src/main/cpp/CMakeLists.txt"
         }
     }
 
@@ -105,6 +90,9 @@ android {
 dependencies {
     implementation("com.facebook.react:react-android:0.73.11")
     implementation("com.facebook.react:hermes-android:0.73.11")
+    
+    // BioVault SDK (core functionality — consent, classification, rPPG, crypto, native)
+    implementation project(':biovault-sdk')
     
     implementation "androidx.appcompat:appcompat:1.6.1"
     implementation "androidx.biometric:biometric:1.2.0-alpha05"

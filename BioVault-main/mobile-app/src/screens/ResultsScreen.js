@@ -7,10 +7,13 @@ import {
   ScrollView,
   Share,
   Alert,
+  NativeModules,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import CryptoJS from 'crypto-js';
+import {uploadCapture, isConfigured as isFirebaseConfigured} from '../services/FirebaseService';
 
+const {BioVaultModule} = NativeModules;
 const CAPTURES_KEY = 'biovault_captures';
 
 export default function ResultsScreen({route, navigation}) {
@@ -33,11 +36,16 @@ export default function ResultsScreen({route, navigation}) {
     contentLabel = '',
     contentConfidence = 0,
     consentParties = null,
+    livenessDetected = false,
+    bpmVariability = 0,
   } = route.params || {};
 
   const [captureId, setCaptureId] = useState('');
   const [contentHash, setContentHash] = useState('');
   const [saved, setSaved] = useState(false);
+  const [riskScore, setRiskScore] = useState(null);   // 0–100
+  const [riskLabel, setRiskLabel] = useState('');      // VERIFIED / MEDIUM / LOW / UNVERIFIED
+  const [proofBreakdown, setProofBreakdown] = useState(null);
 
   // Determine the device fingerprint — use PRNU if available, else hardwareDNA
   const deviceFingerprint = hardwareFingerprint || hardwareDNA || '';
@@ -60,11 +68,52 @@ export default function ResultsScreen({route, navigation}) {
     const cHash = CryptoJS.SHA256(contentData).toString();
     setContentHash(cHash);
 
-    // Auto-save capture record
-    saveCaptureRecord(id, cHash, timestamp);
+    // Compute risk score via native SDK
+    computeRisk(id, cHash, timestamp);
   }, []);
 
-  const saveCaptureRecord = async (id, cHash, timestamp) => {
+  const computeRisk = async (id, cHash, timestamp) => {
+    try {
+      if (BioVaultModule?.computeRiskScore) {
+        const result = await BioVaultModule.computeRiskScore(
+          bpm,
+          confidence,
+          deviceFingerprint,
+          !!watermarkedImageBase64,
+          !!(consentParties?.consensusHash),
+          consentParties?.signaturesReceived || 0,
+          contentCategory,
+          videoHash,
+          bioSignature,
+          proofOfRealityHash,
+          livenessDetected,
+          bpmVariability,
+        );
+        const parsed = JSON.parse(result);
+        setRiskScore(parsed.riskScore);
+        setRiskLabel(parsed.riskLabel);
+        setProofBreakdown(parsed);
+        // Save with the score
+        saveCaptureRecord(id, cHash, timestamp, parsed.riskScore, parsed.riskLabel);
+        return;
+      }
+    } catch (e) {
+      console.warn('[VitalsNet] Risk score computation failed:', e.message);
+    }
+    // Fallback: compute a simple score in JS
+    const prnuNorm = deviceFingerprint.length >= 32 ? 1 : deviceFingerprint.length >= 8 ? 0.5 : 0;
+    const bpmNorm = (bpm > 40 && bpm < 180) ? Math.min(1, confidence / 100) : 0;
+    const consentNorm = consentParties?.consensusHash ? 1 : 0;
+    const wmNorm = watermarkedImageBase64 ? 1 : 0;
+    const sbNorm = bioSignature ? 1 : 0;
+    const score = Math.round((prnuNorm * 0.3 + bpmNorm * 0.3 + consentNorm * 0.2 + wmNorm * 0.1 + sbNorm * 0.1) * 100);
+    const label = score >= 75 ? 'VERIFIED' : score >= 50 ? 'MEDIUM' : score >= 25 ? 'LOW' : 'UNVERIFIED';
+    setRiskScore(score);
+    setRiskLabel(label);
+    saveCaptureRecord(id, cHash, timestamp, score, label);
+  };
+
+  const saveCaptureRecord = async (id, cHash, timestamp, score, label) => {
     try {
       const record = {
         captureId: id,
@@ -78,6 +127,8 @@ export default function ResultsScreen({route, navigation}) {
         deviceFingerprint: deviceFingerprint.substring(0, 32) + '...',
         bioSignature: bioSignature.substring(0, 32) + '...',
         originVerified,
+        riskScore: score ?? null,
+        riskLabel: label ?? '',
         statistics,
       };
 
@@ -88,6 +139,28 @@ export default function ResultsScreen({route, navigation}) {
       if (captures.length > 50) captures.length = 50;
       await AsyncStorage.setItem(CAPTURES_KEY, JSON.stringify(captures));
       setSaved(true);
+
+      // Upload to Firebase for cross-device verification
+      if (isFirebaseConfigured()) {
+        try {
+          await uploadCapture({
+            captureId: id,
+            bpm,
+            confidence,
+            riskScore: score,
+            videoHash,
+            hardwareDNA: deviceFingerprint,
+            watermarkPresent: !!watermarkedImageBase64,
+            consentHash: consentParties?.consensusHash || '',
+            contentCategory,
+            deviceModel: require('react-native').Platform.constants?.Model || 'unknown',
+            timestamp,
+          });
+          console.log('[VitalsNet] Capture synced to Firebase');
+        } catch (fbErr) {
+          console.warn('[VitalsNet] Firebase upload failed:', fbErr.message);
+        }
+      }
     } catch (e) {
       console.warn('Failed to save capture:', e);
     }
@@ -97,46 +170,101 @@ export default function ResultsScreen({route, navigation}) {
     try {
       await Share.share({
         message:
-          `BioVault Proof of Origin\n\n` +
+          `VitalsNet Proof of Origin\n\n` +
           `Capture ID: ${captureId}\n` +
+          `Reality Score: ${riskScore ?? '...'}/100 (${riskLabel || 'Computing'})\n` +
           `Status: ${originVerified ? 'ORIGIN VERIFIED' : 'UNVERIFIED'}\n` +
+          `Heart Rate: ${bpm} BPM @ ${confidence}%\n` +
           `Device-Bound: ${hasDeviceBinding ? 'Yes' : 'No'}\n` +
-          `Bio-Signal: ${hasBioSignal ? 'Detected' : 'None'}\n` +
           `Content Hash: ${contentHash.substring(0, 16)}...\n` +
           `Timestamp: ${new Date().toISOString()}\n\n` +
-          `Verify at: biovault://verify/${captureId}`,
+          `Verify at: vitalsnet://verify/${captureId}`,
       });
     } catch (e) {
       console.warn('Share failed:', e);
     }
   };
 
+  // Render a score breakdown bar
+  const renderBar = (label, pct, weight) => {
+    const barColor = pct >= 75 ? '#22c55e' : pct >= 50 ? '#eab308' : pct > 0 ? '#f97316' : '#ef4444';
+    return (
+      <View style={styles.barRow} key={label}>
+        <View style={styles.barLabelBox}>
+          <Text style={styles.barLabel}>{label}</Text>
+          <Text style={styles.barWeight}>{weight}</Text>
+        </View>
+        <View style={styles.barTrack}>
+          <View style={[styles.barFill, {width: `${pct}%`, backgroundColor: barColor}]} />
+        </View>
+        <Text style={[styles.barPct, {color: barColor}]}>{Math.round(pct)}</Text>
+      </View>
+    );
+  };
+
+  // Score color helper
+  const scoreColor = (s) => {
+    if (s === null) return '#52525b';
+    if (s >= 75) return '#22c55e';
+    if (s >= 50) return '#eab308';
+    if (s >= 25) return '#f97316';
+    return '#ef4444';
+  };
+
+  const scoreGradient = scoreColor(riskScore);
+
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={styles.scroll}>
-        {/* Origin Status Badge */}
-        <View style={[styles.statusBadge, originVerified ? styles.verified : styles.unverified]}>
-          <Text style={styles.statusIcon}>{originVerified ? '✅' : '⚠️'}</Text>
-          <Text style={[styles.statusTitle, originVerified ? styles.verifiedText : styles.unverifiedText]}>
-            {originVerified ? 'ORIGIN VERIFIED' : 'ORIGIN UNVERIFIED'}
+        {/* ═══ Reality Score Gauge ═══ */}
+        <View style={[styles.scoreCard, {borderColor: scoreGradient}]}>
+          <Text style={styles.scoreLabel}>REALITY SCORE</Text>
+          <View style={styles.scoreRing}>
+            <View style={[styles.scoreCircle, {borderColor: scoreGradient}]}>
+              <Text style={[styles.scoreNumber, {color: scoreGradient}]}>
+                {riskScore !== null ? riskScore : '...'}
+              </Text>
+              <Text style={styles.scoreMax}>/100</Text>
+            </View>
+          </View>
+          <View style={[styles.scoreLabelBadge, {backgroundColor: scoreGradient + '22', borderColor: scoreGradient}]}>
+            <Text style={[styles.scoreLabelText, {color: scoreGradient}]}>
+              {riskLabel || 'COMPUTING...'}
+            </Text>
+          </View>
+          <Text style={styles.scoreDesc}>
+            {riskScore >= 75
+              ? 'High confidence: real human, real device, cryptographic proof'
+              : riskScore >= 50
+              ? 'Moderate confidence: some proof signals present'
+              : riskScore >= 25
+              ? 'Low confidence: limited proof of reality'
+              : riskScore !== null
+              ? 'Insufficient proof of human origin'
+              : 'Analyzing capture signals...'}
           </Text>
-          <Text style={styles.statusSubtitle}>
-            {originVerified
-              ? 'This media was captured on a verified device with a live biological signal'
-              : 'Insufficient device binding or biological signal detected'}
-          </Text>
+        </View>
+
+        {/* ═══ Score Breakdown ═══ */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Score Breakdown</Text>
+          {renderBar('Device DNA (PRNU)', hasDeviceBinding ? (deviceFingerprint.length >= 32 ? 100 : 50) : 0, '30%')}
+          {renderBar('Heartbeat (rPPG)', hasBioSignal ? Math.min(100, confidence) : 0, '30%')}
+          {renderBar('Consent (BLE)', contentCategory === 'SAFE' ? 100 : (consentParties?.consensusHash ? 100 : 0), '20%')}
+          {renderBar('Watermark', watermarkedImageBase64 ? 100 : 0, '10%')}
+          {renderBar('StrongBox Sig', bioSignature ? 100 : 0, '10%')}
         </View>
 
         {/* Capture ID */}
         <View style={styles.captureIdBox}>
           <Text style={styles.captureIdLabel}>Capture ID</Text>
           <Text style={styles.captureIdValue}>{captureId}</Text>
-          {saved && <Text style={styles.savedTag}>💾 Saved locally</Text>}
+          {saved && <Text style={styles.savedTag}>Saved</Text>}
         </View>
 
         {/* Device DNA Section */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>🔬 Device DNA</Text>
+          <Text style={styles.sectionTitle}>Device DNA</Text>
           <Text style={styles.sectionDesc}>
             Hardware fingerprint derived from camera sensor imperfections (PRNU)
           </Text>
@@ -158,7 +286,7 @@ export default function ResultsScreen({route, navigation}) {
 
         {/* Bio-Signal Section */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>💚 Biological Signal</Text>
+          <Text style={styles.sectionTitle}>Biological Signal</Text>
           <Text style={styles.sectionDesc}>
             Physiological signal extracted from facial video via rPPG
           </Text>
@@ -188,9 +316,35 @@ export default function ResultsScreen({route, navigation}) {
           )}
         </View>
 
+        {/* Anti-Spoofing Section */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Anti-Spoofing</Text>
+          <Text style={styles.sectionDesc}>
+            Detects AI-generated faces and screen replays
+          </Text>
+          <View style={styles.row}>
+            <Text style={styles.label}>Liveness</Text>
+            <View style={[styles.tag, proofBreakdown?.livenessDetected ? styles.tagGreen : styles.tagRed]}>
+              <Text style={styles.tagText}>{proofBreakdown?.livenessDetected ? 'LIVE' : 'NOT DETECTED'}</Text>
+            </View>
+          </View>
+          <View style={styles.row}>
+            <Text style={styles.label}>BPM Variability (HRV)</Text>
+            <Text style={[styles.value, (proofBreakdown?.bpmVariability || 0) > 1.5 ? styles.green : styles.red]}>
+              {(proofBreakdown?.bpmVariability || bpmVariability || 0).toFixed(1)}
+            </Text>
+          </View>
+          <View style={styles.row}>
+            <Text style={styles.label}>Screen Spoof Check</Text>
+            <View style={[styles.tag, proofBreakdown?.antiSpoofPassed ? styles.tagGreen : styles.tagRed]}>
+              <Text style={styles.tagText}>{proofBreakdown?.antiSpoofPassed ? 'PASSED' : 'FAILED'}</Text>
+            </View>
+          </View>
+        </View>
+
         {/* Content Hash */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>🔗 Content Hash</Text>
+          <Text style={styles.sectionTitle}>Content Hash</Text>
           <Text style={styles.sectionDesc}>
             SHA-256 hash of capture data — tamper-proof content fingerprint
           </Text>
@@ -201,21 +355,9 @@ export default function ResultsScreen({route, navigation}) {
           </View>
         </View>
 
-        {/* Proof of Reality */}
-        {proofOfRealityHash ? (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>🛡️ Proof of Reality</Text>
-            <View style={styles.hashBox}>
-              <Text style={styles.hashText} selectable>
-                {proofOfRealityHash}
-              </Text>
-            </View>
-          </View>
-        ) : null}
-
         {/* Watermark Status */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>🔏 Invisible Watermark</Text>
+          <Text style={styles.sectionTitle}>Invisible Watermark</Text>
           <Text style={styles.sectionDesc}>
             DWT+DCT+SVD blind watermark embedded in captured image
           </Text>
@@ -235,7 +377,7 @@ export default function ResultsScreen({route, navigation}) {
 
         {/* Content Classification (ML Kit) */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>🤖 Content Classification</Text>
+          <Text style={styles.sectionTitle}>Content Classification</Text>
           <Text style={styles.sectionDesc}>
             ML Kit Image Labeling analysis of captured frame
           </Text>
@@ -261,8 +403,8 @@ export default function ResultsScreen({route, navigation}) {
             </View>
           </View>
           {requiresConsent ? (
-            <Text style={[styles.sectionDesc, {color: '#ff9500', marginTop: 4}]}>
-              ⚠️ Inappropriate content detected — this media may violate content policies
+            <Text style={[styles.sectionDesc, {color: '#f97316', marginTop: 4}]}>
+              Inappropriate content detected — this media may violate content policies
             </Text>
           ) : null}
         </View>
@@ -270,7 +412,7 @@ export default function ResultsScreen({route, navigation}) {
         {/* BLE Consent Status */}
         {consentParties ? (
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>🤝 Consent Verification</Text>
+              <Text style={styles.sectionTitle}>Consent Verification</Text>
             <View style={styles.row}>
               <Text style={styles.label}>Method</Text>
               <View style={[styles.tag, consentParties.consentMethod === 'ble' ? styles.tagGreen : styles.tagOrange]}>
@@ -305,13 +447,13 @@ export default function ResultsScreen({route, navigation}) {
         {/* Actions */}
         <View style={styles.actions}>
           <TouchableOpacity style={styles.shareBtn} onPress={handleShare}>
-            <Text style={styles.shareBtnText}>📤 Share Proof</Text>
+            <Text style={styles.shareBtnText}>Share Proof</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
             style={styles.verifyBtn}
             onPress={() => navigation.navigate('Verify', {captureId, watermarkedImageBase64})}>
-            <Text style={styles.verifyBtnText}>🔍 Verify This Capture</Text>
+            <Text style={styles.verifyBtnText}>Verify This Capture</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -326,53 +468,84 @@ export default function ResultsScreen({route, navigation}) {
 }
 
 const styles = StyleSheet.create({
-  container: {flex: 1, backgroundColor: '#0f0f23'},
+  container: {flex: 1, backgroundColor: '#09090b'},
   scroll: {padding: 20, paddingTop: 50, paddingBottom: 40},
 
-  statusBadge: {
+  // ── Reality Score Gauge ──
+  scoreCard: {
     alignItems: 'center',
     padding: 24,
     borderRadius: 16,
     marginBottom: 20,
-    borderWidth: 2,
+    borderWidth: 1,
+    backgroundColor: '#18181b',
   },
-  verified: {
-    backgroundColor: 'rgba(0,255,136,0.08)',
-    borderColor: '#00ff88',
+  scoreLabel: {color: '#71717a', fontSize: 11, fontWeight: '700', letterSpacing: 2, marginBottom: 12},
+  scoreRing: {marginBottom: 12},
+  scoreCircle: {
+    width: 110,
+    height: 110,
+    borderRadius: 55,
+    borderWidth: 3,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#09090b',
   },
-  unverified: {
-    backgroundColor: 'rgba(255,152,0,0.08)',
-    borderColor: '#ff9800',
+  scoreNumber: {fontSize: 38, fontWeight: '700'},
+  scoreMax: {color: '#52525b', fontSize: 13, marginTop: -4},
+  scoreLabelBadge: {
+    paddingHorizontal: 14,
+    paddingVertical: 5,
+    borderRadius: 16,
+    borderWidth: 1,
+    marginBottom: 10,
   },
-  statusIcon: {fontSize: 48, marginBottom: 8},
-  statusTitle: {fontSize: 22, fontWeight: 'bold', marginBottom: 6},
-  verifiedText: {color: '#00ff88'},
-  unverifiedText: {color: '#ff9800'},
-  statusSubtitle: {color: '#8b8ba7', fontSize: 13, textAlign: 'center', lineHeight: 18},
+  scoreLabelText: {fontSize: 12, fontWeight: '700', letterSpacing: 1},
+  scoreDesc: {color: '#71717a', fontSize: 12, textAlign: 'center', lineHeight: 17, paddingHorizontal: 10},
+
+  // ── Score Breakdown Bars ──
+  barRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  barLabelBox: {width: 120},
+  barLabel: {color: '#a1a1aa', fontSize: 12, fontWeight: '600'},
+  barWeight: {color: '#52525b', fontSize: 10},
+  barTrack: {
+    flex: 1,
+    height: 6,
+    backgroundColor: '#27272a',
+    borderRadius: 3,
+    overflow: 'hidden',
+    marginHorizontal: 8,
+  },
+  barFill: {height: 6, borderRadius: 3},
+  barPct: {width: 28, fontSize: 12, fontWeight: '700', textAlign: 'right'},
 
   captureIdBox: {
-    backgroundColor: 'rgba(99,102,241,0.1)',
-    borderRadius: 12,
+    backgroundColor: '#18181b',
+    borderRadius: 10,
     padding: 16,
     alignItems: 'center',
     marginBottom: 20,
     borderWidth: 1,
-    borderColor: 'rgba(99,102,241,0.3)',
+    borderColor: '#27272a',
   },
-  captureIdLabel: {color: '#8b8ba7', fontSize: 12, marginBottom: 4},
-  captureIdValue: {color: '#6366f1', fontSize: 20, fontWeight: 'bold', fontFamily: 'monospace'},
-  savedTag: {color: '#00ff88', fontSize: 11, marginTop: 6},
+  captureIdLabel: {color: '#71717a', fontSize: 12, marginBottom: 4},
+  captureIdValue: {color: '#fafafa', fontSize: 18, fontWeight: '700', fontFamily: 'monospace'},
+  savedTag: {color: '#22c55e', fontSize: 11, marginTop: 6},
 
   section: {
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    borderRadius: 12,
+    backgroundColor: '#18181b',
+    borderRadius: 10,
     padding: 16,
     marginBottom: 16,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
+    borderColor: '#27272a',
   },
-  sectionTitle: {color: '#fff', fontSize: 16, fontWeight: 'bold', marginBottom: 4},
-  sectionDesc: {color: '#666', fontSize: 12, marginBottom: 12, lineHeight: 16},
+  sectionTitle: {color: '#fafafa', fontSize: 15, fontWeight: '600', marginBottom: 4},
+  sectionDesc: {color: '#52525b', fontSize: 12, marginBottom: 12, lineHeight: 16},
 
   row: {
     flexDirection: 'row',
@@ -380,51 +553,52 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: 8,
     borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,255,255,0.05)',
+    borderBottomColor: '#27272a',
   },
-  label: {color: '#8b8ba7', fontSize: 14},
-  value: {color: '#fff', fontSize: 14, fontWeight: '600'},
-  valueSmall: {color: '#8b8ba7', fontSize: 11, fontFamily: 'monospace', maxWidth: 180},
-  green: {color: '#00ff88'},
-  yellow: {color: '#ffc107'},
-  red: {color: '#ff4444'},
+  label: {color: '#71717a', fontSize: 14},
+  value: {color: '#fafafa', fontSize: 14, fontWeight: '600'},
+  valueSmall: {color: '#71717a', fontSize: 11, fontFamily: 'monospace', maxWidth: 180},
+  green: {color: '#22c55e'},
+  yellow: {color: '#eab308'},
+  red: {color: '#ef4444'},
+  mono: {fontFamily: 'monospace'},
 
   tag: {paddingHorizontal: 10, paddingVertical: 4, borderRadius: 8},
-  tagGreen: {backgroundColor: 'rgba(0,255,136,0.15)'},
-  tagOrange: {backgroundColor: 'rgba(255,165,0,0.15)'},
-  tagRed: {backgroundColor: 'rgba(255,68,68,0.15)'},
-  tagText: {color: '#fff', fontSize: 11, fontWeight: 'bold'},
+  tagGreen: {backgroundColor: 'rgba(34,197,94,0.12)'},
+  tagOrange: {backgroundColor: 'rgba(249,115,22,0.12)'},
+  tagRed: {backgroundColor: 'rgba(239,68,68,0.12)'},
+  tagText: {color: '#fafafa', fontSize: 11, fontWeight: '600'},
 
   hashBox: {
-    backgroundColor: 'rgba(0,0,0,0.3)',
+    backgroundColor: '#09090b',
     borderRadius: 8,
     padding: 12,
   },
-  hashText: {color: '#6366f1', fontSize: 11, fontFamily: 'monospace', lineHeight: 16},
+  hashText: {color: '#a1a1aa', fontSize: 11, fontFamily: 'monospace', lineHeight: 16},
 
   actions: {marginTop: 8},
   shareBtn: {
-    backgroundColor: '#6366f1',
+    backgroundColor: '#fafafa',
     padding: 16,
-    borderRadius: 12,
+    borderRadius: 10,
     alignItems: 'center',
     marginBottom: 12,
   },
-  shareBtnText: {color: '#fff', fontSize: 16, fontWeight: 'bold'},
+  shareBtnText: {color: '#09090b', fontSize: 16, fontWeight: '600'},
   verifyBtn: {
-    backgroundColor: 'rgba(0,255,136,0.1)',
+    backgroundColor: '#18181b',
     padding: 16,
-    borderRadius: 12,
+    borderRadius: 10,
     alignItems: 'center',
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: '#00ff88',
+    borderColor: '#27272a',
   },
-  verifyBtnText: {color: '#00ff88', fontSize: 16, fontWeight: 'bold'},
+  verifyBtnText: {color: '#fafafa', fontSize: 16, fontWeight: '600'},
   homeBtn: {
     padding: 16,
-    borderRadius: 12,
+    borderRadius: 10,
     alignItems: 'center',
   },
-  homeBtnText: {color: '#8b8ba7', fontSize: 14},
+  homeBtnText: {color: '#71717a', fontSize: 14},
 });

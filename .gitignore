@@ -1,0 +1,10 @@
+# Root workspace artifacts
+build/
+ui*.xml
+screen.png
+
+# Local environments
+.venv/
+
+# Native Android intermediate outputs
+BioVault-main/mobile-app/android/biovault-sdk/.cxx/

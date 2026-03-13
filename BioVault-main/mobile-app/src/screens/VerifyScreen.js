@@ -8,8 +8,12 @@ import {
   ScrollView,
   ActivityIndicator,
   NativeModules,
+  Alert,
+  Clipboard,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import RNFS from 'react-native-fs';
+import {lookupCapture, isConfigured as isFirebaseConfigured} from '../services/FirebaseService';
 
 const {BioVaultModule} = NativeModules;
 const CAPTURES_KEY = 'biovault_captures';
@@ -46,7 +50,20 @@ export default function VerifyScreen({route, navigation}) {
       const found = captures.find(c => c.captureId === lookupId);
 
       if (found) {
-        setResult(found);
+        setResult({...found, source: 'local'});
+      } else if (isFirebaseConfigured()) {
+        // Fallback: search Firebase cloud
+        try {
+          const cloudResult = await lookupCapture(lookupId);
+          if (cloudResult) {
+            setResult({...cloudResult, source: 'cloud'});
+          } else {
+            setNotFound(true);
+          }
+        } catch (fbErr) {
+          console.warn('[VitalsNet] Firebase lookup failed:', fbErr.message);
+          setNotFound(true);
+        }
       } else {
         setNotFound(true);
       }
@@ -66,12 +83,14 @@ export default function VerifyScreen({route, navigation}) {
       if (decoded) {
         const parsed = JSON.parse(decoded);
         setWatermarkData(parsed);
-        console.log('[BioVault] Watermark extracted:', decoded);
+        Clipboard.setString(JSON.stringify(parsed, null, 2));
+        Alert.alert('Watermark Extracted', 'Data copied to clipboard');
+        console.log('[VitalsNet] Watermark extracted:', decoded);
       } else {
         setWatermarkData(null);
       }
     } catch (err) {
-      console.warn('[BioVault] Watermark extraction failed:', err.message);
+      console.warn('[VitalsNet] Watermark extraction failed:', err.message);
       setWatermarkData(null);
     } finally {
       setWmExtracting(false);
@@ -81,12 +100,10 @@ export default function VerifyScreen({route, navigation}) {
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={styles.scroll}>
-        {/* Header */}
         <View style={styles.header}>
-          <Text style={styles.headerIcon}>🔍</Text>
           <Text style={styles.headerTitle}>Verify Capture</Text>
           <Text style={styles.headerDesc}>
-            Enter a BioVault Capture ID to verify its authenticity and origin
+            Enter a VitalsNet Capture ID to verify its authenticity and origin
           </Text>
         </View>
 
@@ -95,7 +112,7 @@ export default function VerifyScreen({route, navigation}) {
           <TextInput
             style={styles.input}
             placeholder="BV-XXXXXXXXXXXX"
-            placeholderTextColor="#555"
+            placeholderTextColor="#52525b"
             value={searchId}
             onChangeText={setSearchId}
             autoCapitalize="characters"
@@ -116,8 +133,33 @@ export default function VerifyScreen({route, navigation}) {
         {/* Result — Verified */}
         {result && (
           <View style={styles.resultCard}>
+            {/* Source indicator */}
+            {result.source === 'cloud' && (
+              <View style={{backgroundColor: '#22c55e18', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 6, marginBottom: 12, alignSelf: 'flex-start'}}>
+                <Text style={{color: '#22c55e', fontSize: 12, fontWeight: '600'}}>☁ Found on Cloud (cross-device)</Text>
+              </View>
+            )}
+            {/* Risk Score (if available) */}
+            {result.riskScore != null && (
+              <View style={styles.scoreRow}>
+                <View style={[styles.scoreCircle, {borderColor: result.riskScore >= 75 ? '#22c55e' : result.riskScore >= 50 ? '#eab308' : result.riskScore >= 25 ? '#f97316' : '#ef4444'}]}>
+                  <Text style={[styles.scoreNum, {color: result.riskScore >= 75 ? '#22c55e' : result.riskScore >= 50 ? '#eab308' : result.riskScore >= 25 ? '#f97316' : '#ef4444'}]}>
+                    {result.riskScore}
+                  </Text>
+                </View>
+                <View style={styles.scoreInfo}>
+                  <Text style={styles.scoreTitle}>Reality Score</Text>
+                  <View style={[styles.scoreBadge, {backgroundColor: (result.riskScore >= 75 ? '#22c55e' : result.riskScore >= 50 ? '#eab308' : '#f97316') + '18'}]}>
+                    <Text style={[styles.scoreBadgeText, {color: result.riskScore >= 75 ? '#22c55e' : result.riskScore >= 50 ? '#eab308' : '#f97316'}]}>
+                      {result.riskLabel || (result.riskScore >= 75 ? 'VERIFIED' : result.riskScore >= 50 ? 'MEDIUM' : 'LOW')}
+                    </Text>
+                  </View>
+                </View>
+              </View>
+            )}
+
             <View style={[styles.resultBadge, result.originVerified ? styles.badgeGreen : styles.badgeOrange]}>
-              <Text style={styles.badgeIcon}>{result.originVerified ? '✅' : '⚠️'}</Text>
+              <Text style={styles.badgeIcon}>{result.originVerified ? '' : ''}</Text>
               <Text style={[styles.badgeTitle, result.originVerified ? styles.greenText : styles.orangeText]}>
                 {result.originVerified ? 'ORIGIN VERIFIED' : 'ORIGIN UNVERIFIED'}
               </Text>
@@ -177,11 +219,10 @@ export default function VerifyScreen({route, navigation}) {
         {/* Not Found */}
         {notFound && (
           <View style={styles.notFoundCard}>
-            <Text style={styles.notFoundIcon}>❌</Text>
-            <Text style={styles.notFoundTitle}>NO RECORD FOUND</Text>
+          <Text style={styles.notFoundTitle}>NO RECORD FOUND</Text>
             <Text style={styles.notFoundDesc}>
               This Capture ID was not found in the local database.
-              The media was either not captured through BioVault or has been tampered with.
+              The media was either not captured through VitalsNet or has been tampered with.
             </Text>
           </View>
         )}
@@ -190,7 +231,7 @@ export default function VerifyScreen({route, navigation}) {
         {(wmExtracting || watermarkData !== null) && (
           <View style={styles.resultCard}>
             <View style={[styles.resultBadge, watermarkData ? styles.badgeGreen : styles.badgeOrange]}>
-              <Text style={styles.badgeIcon}>{wmExtracting ? '⏳' : watermarkData ? '🔏' : '❌'}</Text>
+              <Text style={styles.badgeIcon}>{wmExtracting ? '' : watermarkData ? '' : ''}</Text>
               <Text style={[styles.badgeTitle, watermarkData ? styles.greenText : styles.orangeText]}>
                 {wmExtracting ? 'EXTRACTING WATERMARK...' : watermarkData ? 'WATERMARK VERIFIED' : 'NO WATERMARK'}
               </Text>
@@ -226,6 +267,36 @@ export default function VerifyScreen({route, navigation}) {
           </View>
         )}
 
+        {/* Import Watermarked Image */}
+        <TouchableOpacity
+          style={styles.importBtn}
+          onPress={async () => {
+            try {
+              // Look for watermarked images saved by VitalsNet in the media dir
+              const mediaDir = RNFS.DocumentDirectoryPath + '/biovault/media';
+              const exists = await RNFS.exists(mediaDir);
+              if (!exists) {
+                Alert.alert('No Media', 'No VitalsNet capture files found. Take a capture first, then share the watermarked image and verify it here.');
+                return;
+              }
+              // Read the latest watermarked PNG from Downloads or Documents
+              // For demo: use the watermark from the most recent capture passed via navigation
+              if (route.params?.watermarkedImageBase64) {
+                extractWatermark(route.params.watermarkedImageBase64);
+              } else {
+                Alert.alert(
+                  'Verify Watermark',
+                  'To verify a watermarked image:\n\n1. Take a capture in VitalsNet\n2. From Results, tap "Verify This Capture"\n3. The watermark is automatically extracted\n\nThe watermarked image data is embedded in every VitalsNet capture.',
+                  [{text: 'OK'}]
+                );
+              }
+            } catch (e) {
+              Alert.alert('Error', e.message);
+            }
+          }}>
+          <Text style={styles.importBtnText}>Extract Watermark from Capture</Text>
+        </TouchableOpacity>
+
         {/* Back */}
         <TouchableOpacity
           style={styles.backBtn}
@@ -238,13 +309,12 @@ export default function VerifyScreen({route, navigation}) {
 }
 
 const styles = StyleSheet.create({
-  container: {flex: 1, backgroundColor: '#0f0f23'},
+  container: {flex: 1, backgroundColor: '#09090b'},
   scroll: {padding: 20, paddingTop: 50, paddingBottom: 40},
 
   header: {alignItems: 'center', marginBottom: 24},
-  headerIcon: {fontSize: 48, marginBottom: 8},
-  headerTitle: {color: '#fff', fontSize: 24, fontWeight: 'bold', marginBottom: 6},
-  headerDesc: {color: '#8b8ba7', fontSize: 13, textAlign: 'center', lineHeight: 18},
+  headerTitle: {color: '#fafafa', fontSize: 22, fontWeight: '700', marginBottom: 6},
+  headerDesc: {color: '#71717a', fontSize: 13, textAlign: 'center', lineHeight: 18},
 
   searchBox: {
     flexDirection: 'row',
@@ -252,46 +322,46 @@ const styles = StyleSheet.create({
   },
   input: {
     flex: 1,
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: '#18181b',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.15)',
-    borderRadius: 12,
+    borderColor: '#27272a',
+    borderRadius: 10,
     paddingHorizontal: 16,
     paddingVertical: 14,
-    color: '#fff',
+    color: '#fafafa',
     fontSize: 16,
     fontFamily: 'monospace',
     marginRight: 10,
   },
   searchBtn: {
-    backgroundColor: '#6366f1',
+    backgroundColor: '#fafafa',
     paddingHorizontal: 20,
-    borderRadius: 12,
+    borderRadius: 10,
     justifyContent: 'center',
     alignItems: 'center',
   },
-  searchBtnText: {color: '#fff', fontSize: 14, fontWeight: 'bold'},
+  searchBtnText: {color: '#09090b', fontSize: 14, fontWeight: '600'},
 
   resultCard: {
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    borderRadius: 16,
+    backgroundColor: '#18181b',
+    borderRadius: 12,
     padding: 20,
     marginBottom: 20,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
+    borderColor: '#27272a',
   },
   resultBadge: {
     alignItems: 'center',
     padding: 16,
-    borderRadius: 12,
+    borderRadius: 10,
     marginBottom: 16,
   },
-  badgeGreen: {backgroundColor: 'rgba(0,255,136,0.1)'},
-  badgeOrange: {backgroundColor: 'rgba(255,152,0,0.1)'},
-  badgeIcon: {fontSize: 36, marginBottom: 6},
-  badgeTitle: {fontSize: 18, fontWeight: 'bold'},
-  greenText: {color: '#00ff88'},
-  orangeText: {color: '#ff9800'},
+  badgeGreen: {backgroundColor: 'rgba(34,197,94,0.08)'},
+  badgeOrange: {backgroundColor: 'rgba(249,115,22,0.08)'},
+  badgeIcon: {fontSize: 0, height: 0},
+  badgeTitle: {fontSize: 16, fontWeight: '700'},
+  greenText: {color: '#22c55e'},
+  orangeText: {color: '#f97316'},
 
   detailRow: {
     flexDirection: 'row',
@@ -299,41 +369,77 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: 10,
     borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,255,255,0.05)',
+    borderBottomColor: '#27272a',
   },
-  detailLabel: {color: '#8b8ba7', fontSize: 14},
-  detailValue: {color: '#fff', fontSize: 14, fontWeight: '600'},
+  detailLabel: {color: '#71717a', fontSize: 14},
+  detailValue: {color: '#fafafa', fontSize: 14, fontWeight: '600'},
 
   miniTag: {paddingHorizontal: 10, paddingVertical: 3, borderRadius: 6},
-  miniGreen: {backgroundColor: 'rgba(0,255,136,0.15)'},
-  miniRed: {backgroundColor: 'rgba(255,68,68,0.15)'},
-  miniTagText: {color: '#fff', fontSize: 11, fontWeight: 'bold'},
+  miniGreen: {backgroundColor: 'rgba(34,197,94,0.12)'},
+  miniRed: {backgroundColor: 'rgba(239,68,68,0.12)'},
+  miniTagText: {color: '#fafafa', fontSize: 11, fontWeight: '600'},
 
   hashSection: {marginTop: 12},
-  hashLabel: {color: '#8b8ba7', fontSize: 12, marginBottom: 4},
+  hashLabel: {color: '#71717a', fontSize: 12, marginBottom: 4},
   hashValue: {
-    color: '#6366f1',
+    color: '#a1a1aa',
     fontSize: 10,
     fontFamily: 'monospace',
     lineHeight: 14,
-    backgroundColor: 'rgba(0,0,0,0.3)',
+    backgroundColor: '#09090b',
     padding: 10,
     borderRadius: 8,
   },
 
   notFoundCard: {
-    backgroundColor: 'rgba(255,68,68,0.06)',
-    borderRadius: 16,
+    backgroundColor: 'rgba(239,68,68,0.05)',
+    borderRadius: 12,
     padding: 24,
     alignItems: 'center',
     marginBottom: 20,
     borderWidth: 1,
-    borderColor: 'rgba(255,68,68,0.2)',
+    borderColor: 'rgba(239,68,68,0.15)',
   },
-  notFoundIcon: {fontSize: 48, marginBottom: 8},
-  notFoundTitle: {color: '#ff4444', fontSize: 20, fontWeight: 'bold', marginBottom: 8},
-  notFoundDesc: {color: '#8b8ba7', fontSize: 13, textAlign: 'center', lineHeight: 18},
+  notFoundTitle: {color: '#ef4444', fontSize: 18, fontWeight: '700', marginBottom: 8},
+  notFoundDesc: {color: '#71717a', fontSize: 13, textAlign: 'center', lineHeight: 18},
 
   backBtn: {padding: 16, alignItems: 'center'},
-  backBtnText: {color: '#8b8ba7', fontSize: 14},
+  backBtnText: {color: '#71717a', fontSize: 14},
+
+  // ── Risk Score in Result Card ──
+  scoreRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 16,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#27272a',
+  },
+  scoreCircle: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    borderWidth: 2,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#09090b',
+    marginRight: 14,
+  },
+  scoreNum: {fontSize: 22, fontWeight: '700'},
+  scoreInfo: {flex: 1},
+  scoreTitle: {color: '#71717a', fontSize: 11, fontWeight: '700', letterSpacing: 1, marginBottom: 4},
+  scoreBadge: {alignSelf: 'flex-start', paddingHorizontal: 10, paddingVertical: 3, borderRadius: 10},
+  scoreBadgeText: {fontSize: 12, fontWeight: '700'},
+
+  // ── Import Button ──
+  importBtn: {
+    backgroundColor: '#18181b',
+    padding: 16,
+    borderRadius: 10,
+    alignItems: 'center',
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#27272a',
+  },
+  importBtnText: {color: '#a1a1aa', fontSize: 15, fontWeight: '600'},
 });

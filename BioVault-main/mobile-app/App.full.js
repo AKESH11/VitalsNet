@@ -10,11 +10,12 @@ import CameraScreen from './src/screens/CameraScreen';
 import ResultsScreen from './src/screens/ResultsScreen';
 import VerifyScreen from './src/screens/VerifyScreen';
 import CalibrationScreen from './src/screens/CalibrationScreen';
+import PrivacyShieldScreen from './src/screens/PrivacyShieldScreen';
 
 const Stack = createStackNavigator();
 
 const linking = {
-  prefixes: ['biovault://', 'https://biovault.io'],
+  prefixes: ['vitalsnet://', 'https://vitalsnet.io'],
   config: {
     screens: {
       Home: 'home',
@@ -40,7 +41,7 @@ export default function App() {
             initialRouteName="Login"
             screenOptions={{
               headerShown: false,
-              cardStyle: { backgroundColor: '#0f0f23' },
+              cardStyle: { backgroundColor: '#09090b' },
               gestureEnabled: true,
             }}>
             <Stack.Screen name="Login" component={LoginScreen} />
@@ -49,6 +50,7 @@ export default function App() {
             <Stack.Screen name="Camera" component={CameraScreen} />
             <Stack.Screen name="Results" component={ResultsScreen} />
             <Stack.Screen name="Verify" component={VerifyScreen} />
+            <Stack.Screen name="PrivacyShield" component={PrivacyShieldScreen} />
           </Stack.Navigator>
         </NavigationContainer>
       </ErrorBoundary>

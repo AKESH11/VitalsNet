@@ -44,6 +44,7 @@ public class BioVaultCameraViewManager extends SimpleViewManager<TextureView> {
     private ImageReader imageReader;
     private Size previewSize = new Size(640, 480);
     private boolean isCalibrationMode = false;
+    private int desiredFacing = CameraCharacteristics.LENS_FACING_FRONT;
     
     @Override
     public String getName() {
@@ -110,6 +111,22 @@ public class BioVaultCameraViewManager extends SimpleViewManager<TextureView> {
         Log.d(TAG, "Calibration mode: " + calibrationMode);
         isCalibrationMode = calibrationMode;
     }
+
+    @ReactProp(name = "cameraFacing")
+    public void setCameraFacing(TextureView view, String facing) {
+        int newFacing = "back".equalsIgnoreCase(facing)
+            ? CameraCharacteristics.LENS_FACING_BACK
+            : CameraCharacteristics.LENS_FACING_FRONT;
+        if (newFacing != desiredFacing) {
+            Log.d(TAG, "Switching camera facing: " + facing);
+            desiredFacing = newFacing;
+            currentView = view;
+            if (cameraDevice != null) {
+                closeCamera();
+                openCamera((ReactContext) view.getContext());
+            }
+        }
+    }
     
     private void startBackgroundThread() {
         backgroundThread = new HandlerThread("CameraBackground");
@@ -145,12 +162,12 @@ public class BioVaultCameraViewManager extends SimpleViewManager<TextureView> {
         try {
             CameraManager manager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
             
-            // Find front camera
+            // Find camera matching desired facing
             String cameraId = null;
             for (String id : manager.getCameraIdList()) {
                 CameraCharacteristics characteristics = manager.getCameraCharacteristics(id);
                 Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
-                if (facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                if (facing != null && facing == desiredFacing) {
                     cameraId = id;
                     
                     // Get optimal preview size
@@ -166,8 +183,9 @@ public class BioVaultCameraViewManager extends SimpleViewManager<TextureView> {
             }
             
             if (cameraId == null) {
-                Log.e(TAG, "No front camera found");
-                sendEvent(context, "onCameraError", "No front camera found");
+                String label = (desiredFacing == CameraCharacteristics.LENS_FACING_FRONT) ? "front" : "back";
+                Log.e(TAG, "No " + label + " camera found");
+                sendEvent(context, "onCameraError", "No " + label + " camera found");
                 return;
             }
             

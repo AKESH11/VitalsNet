@@ -12,6 +12,7 @@ import {
   Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import VitalsNetLogo from '../components/VitalsNetLogo';
 
 const USER_PROFILE_KEY = 'biovault_user_profile';
 const CALIBRATION_KEY = 'biovault_prnu_calibrated';
@@ -24,16 +25,16 @@ export default function LoginScreen({navigation}) {
 
   // Auto-login: check local profile
   useEffect(() => {
-    console.log('[BioVault] LoginScreen mounted');
+    console.log('[VitalsNet] LoginScreen mounted');
     (async () => {
       try {
         const profile = await AsyncStorage.getItem(USER_PROFILE_KEY);
-        console.log('[BioVault] LoginScreen auto-check profile:', profile ? 'FOUND' : 'NONE');
+        console.log('[VitalsNet] LoginScreen auto-check profile:', profile ? 'FOUND' : 'NONE');
         if (profile) {
           // Check if PRNU calibration is done
           const calib = await AsyncStorage.getItem(CALIBRATION_KEY);
           if (!calib) {
-            console.log('[BioVault] PRNU not calibrated — navigating to Calibration');
+            console.log('[VitalsNet] PRNU not calibrated — navigating to Calibration');
             navigation.replace('Calibration');
             return;
           }
@@ -41,7 +42,7 @@ export default function LoginScreen({navigation}) {
           return;
         }
       } catch (e) {
-        console.log('[BioVault] LoginScreen auto-check error:', e.message);
+        console.log('[VitalsNet] LoginScreen auto-check error:', e.message);
       }
       setAutoChecking(false);
     })();
@@ -71,8 +72,8 @@ export default function LoginScreen({navigation}) {
   if (autoChecking) {
     return (
       <View style={[styles.container, styles.center]}>
-        <ActivityIndicator size="large" color="#6366f1" />
-        <Text style={styles.checkingText}>Loading BioVault...</Text>
+        <ActivityIndicator size="large" color="#52525b" />
+        <Text style={styles.checkingText}>Loading...</Text>
       </View>
     );
   }
@@ -85,12 +86,9 @@ export default function LoginScreen({navigation}) {
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled">
         <View style={styles.header}>
-          <Text style={styles.logo}>🔐</Text>
-          <Text style={styles.title}>BioVault</Text>
+          <VitalsNetLogo />
+          <Text style={styles.title}>VitalsNet</Text>
           <Text style={styles.subtitle}>Proof of Human Capture</Text>
-          <Text style={styles.tagline}>
-            Cryptographic device binding + biological signals
-          </Text>
         </View>
 
         <View style={styles.form}>
@@ -98,7 +96,7 @@ export default function LoginScreen({navigation}) {
           <TextInput
             style={styles.input}
             placeholder="Enter your name"
-            placeholderTextColor="#555"
+            placeholderTextColor="#52525b"
             autoCapitalize="none"
             value={email}
             onChangeText={setEmail}
@@ -109,7 +107,7 @@ export default function LoginScreen({navigation}) {
             onPress={handleLogin}
             disabled={loading}>
             {loading ? (
-              <ActivityIndicator color="#fff" />
+              <ActivityIndicator color="#09090b" />
             ) : (
               <Text style={styles.buttonText}>Get Started</Text>
             )}
@@ -117,10 +115,10 @@ export default function LoginScreen({navigation}) {
         </View>
 
         <View style={styles.features}>
-          <Text style={styles.featureItem}>🔬 Device DNA — PRNU camera fingerprinting</Text>
-          <Text style={styles.featureItem}>💚 Bio-Signal — rPPG heartbeat extraction</Text>
-          <Text style={styles.featureItem}>🔗 Content Hash — SHA-256 tamper-proof</Text>
-          <Text style={styles.featureItem}>🇮🇳 IT Rules 2026 Compliant</Text>
+          <Text style={styles.featureItem}>Device DNA — PRNU fingerprinting</Text>
+          <Text style={styles.featureItem}>Bio-Signal — rPPG heartbeat</Text>
+          <Text style={styles.featureItem}>Content Hash — SHA-256</Text>
+          <Text style={styles.featureItem}>IT Rules 2026 Compliant</Text>
         </View>
       </ScrollView>
     </KeyboardAvoidingView>
@@ -129,14 +127,14 @@ export default function LoginScreen({navigation}) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#0f0f23',
+    backgroundColor: '#09090b',
   },
   center: {
     justifyContent: 'center',
     alignItems: 'center',
   },
   checkingText: {
-    color: '#8b8ba7',
+    color: '#71717a',
     marginTop: 16,
     fontSize: 14,
   },
@@ -144,78 +142,84 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     justifyContent: 'center',
     paddingHorizontal: 24,
-    paddingVertical: 40,
+    paddingVertical: 48,
   },
   header: {
     alignItems: 'center',
-    marginBottom: 40,
+    marginBottom: 48,
   },
-  logo: {
-    fontSize: 56,
-    marginBottom: 12,
+  logoMark: {
+    fontSize: 24,
+    fontWeight: '800',
+    color: '#fafafa',
+    letterSpacing: 8,
+    marginBottom: 20,
+    borderWidth: 1.5,
+    borderColor: '#fafafa',
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 8,
   },
   title: {
-    fontSize: 32,
-    fontWeight: 'bold',
-    color: '#ffffff',
+    fontSize: 28,
+    fontWeight: '700',
+    color: '#fafafa',
+    marginTop: 16,
     marginBottom: 4,
+    letterSpacing: 1,
   },
   subtitle: {
-    fontSize: 16,
-    color: '#00ff88',
-    fontWeight: '600',
-    marginBottom: 8,
-  },
-  tagline: {
-    fontSize: 13,
-    color: '#8b8ba7',
-    textAlign: 'center',
+    fontSize: 14,
+    color: '#71717a',
+    fontWeight: '500',
   },
   form: {
     width: '100%',
   },
   inputLabel: {
-    color: '#8b8ba7',
+    color: '#a1a1aa',
     fontSize: 13,
-    marginBottom: 6,
-    marginLeft: 4,
+    fontWeight: '500',
+    marginBottom: 8,
+    marginLeft: 2,
   },
   input: {
-    backgroundColor: '#1a1a3e',
+    backgroundColor: '#18181b',
     borderWidth: 1,
-    borderColor: '#2d2d5f',
-    borderRadius: 12,
+    borderColor: '#27272a',
+    borderRadius: 10,
     paddingHorizontal: 16,
     paddingVertical: 14,
-    color: '#ffffff',
+    color: '#fafafa',
     fontSize: 16,
     marginBottom: 16,
   },
   button: {
-    backgroundColor: '#6366f1',
-    borderRadius: 12,
+    backgroundColor: '#fafafa',
+    borderRadius: 10,
     paddingVertical: 16,
     alignItems: 'center',
     marginTop: 8,
   },
   buttonDisabled: {
-    opacity: 0.6,
+    opacity: 0.5,
   },
   buttonText: {
-    color: '#ffffff',
-    fontSize: 17,
+    color: '#09090b',
+    fontSize: 16,
     fontWeight: '600',
   },
   features: {
-    marginTop: 40,
+    marginTop: 48,
     paddingTop: 20,
     borderTopWidth: 1,
-    borderTopColor: '#2d2d5f',
+    borderTopColor: '#27272a',
   },
   featureItem: {
-    color: '#8b8ba7',
+    color: '#52525b',
     fontSize: 13,
     marginBottom: 10,
     lineHeight: 18,
+    textAlign: 'center',
   },
 });

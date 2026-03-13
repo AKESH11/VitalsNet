@@ -1,5 +1,6 @@
 rootProject.name = 'TempApp'
 include ':app'
+include ':biovault-sdk'
 
 // React Native auto-linking (check multiple locations — workspace hoisting puts node_modules at repo root)
 def rnCliPath = file("../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")

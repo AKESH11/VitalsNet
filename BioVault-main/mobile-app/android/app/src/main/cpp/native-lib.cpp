@@ -26,7 +26,7 @@ extern "C" {
  * Called from Kotlin: initializeNativeBridge(strongBoxManager)
  */
 JNIEXPORT void JNICALL
-Java_com_biovault_StrongBoxManager_initializeNativeBridge(
+Java_com_biovault_sdk_StrongBoxManager_initializeNativeBridge(
     JNIEnv* env,
     jobject strongBoxManagerInstance) {
     
@@ -185,7 +185,7 @@ Java_com_biovault_BioVaultModule_testStrongBoxSignature(
  * Cleanup JNI bridge
  */
 JNIEXPORT void JNICALL
-Java_com_biovault_StrongBoxManager_cleanupNativeBridge(
+Java_com_biovault_sdk_StrongBoxManager_cleanupNativeBridge(
     JNIEnv* env,
     jobject /* this */) {
     

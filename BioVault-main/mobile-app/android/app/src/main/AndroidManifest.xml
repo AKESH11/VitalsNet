@@ -22,6 +22,9 @@
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     
     <!-- Hardware features -->
     <uses-feature android:name="android.hardware.camera" android:required="true" />
@@ -30,7 +33,7 @@
 
     <application
         android:name=".MainApplication"
-        android:label="BioVault"
+        android:label="VitalsNet"
         android:icon="@android:drawable/sym_def_app_icon"
         android:roundIcon="@android:drawable/sym_def_app_icon"
         android:allowBackup="false"
@@ -49,23 +52,28 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Deep Link: biovault://verify/0xMediaHash -->
+            <!-- Deep Link: vitalsnet://verify/0xMediaHash -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="biovault" />
+                <data android:scheme="vitalsnet" />
             </intent-filter>
 
-            <!-- Universal Link: https://biovault.io/verify/0xMediaHash -->
+            <!-- Universal Link: https://vitalsnet.io/verify/0xMediaHash -->
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="biovault.io" />
+                <data android:scheme="https" android:host="vitalsnet.io" />
             </intent-filter>
 
         </activity>
+
+        <service
+            android:name=".PrivacyShieldService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
 
     </application>
 

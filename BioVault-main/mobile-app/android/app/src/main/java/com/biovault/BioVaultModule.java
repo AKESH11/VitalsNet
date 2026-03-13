@@ -6,6 +6,12 @@ import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
 import android.content.Context;
 
+import com.biovault.sdk.CaptureProof;
+import com.biovault.sdk.ConsentBroadcaster;
+import com.biovault.sdk.ContentClassifier;
+import com.biovault.sdk.StrongBoxManager;
+import com.biovault.sdk.TSCANInference;
+
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
@@ -50,6 +56,10 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
 
     // Last captured frame for watermark embedding (base64 JPEG)
     private String lastFrameBase64 = null;
+
+    // Anti-spoofing: BPM history for HRV computation + liveness state
+    private java.util.ArrayList<Float> bpmHistory = new java.util.ArrayList<>();
+    private boolean lastLivenessState = false;
 
     // Face tracking stabilization (exponential moving average)
     private float[] smoothedFaceBounds = null;  // [x, y, width, height]
@@ -545,7 +555,23 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
                 // Parse face detection from C++ result
                 org.json.JSONObject json = new org.json.JSONObject(cppResult);
                 int facesDetected = json.has("facesDetected") ? json.getInt("facesDetected") : 0;
-                
+
+                // Cache last frame as base64 JPEG for watermark embedding (regardless of face detection)
+                if (isRPPGSessionActive) {
+                    try {
+                        Bitmap snapBmp = yuvToBitmap(frameData, width, height, rotation);
+                        if (snapBmp != null) {
+                            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                            snapBmp.compress(Bitmap.CompressFormat.JPEG, 90, baos);
+                            snapBmp.recycle();
+                            lastFrameBase64 = android.util.Base64.encodeToString(
+                                baos.toByteArray(), android.util.Base64.NO_WRAP);
+                        }
+                    } catch (Exception snapErr) {
+                        // Non-fatal
+                    }
+                }
+
                 // Only add frames when face is detected
                 if (facesDetected > 0) {
                     Bitmap frameBitmap = yuvToBitmap(frameData, width, height, rotation);
@@ -585,22 +611,6 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
                     
                     // Get current BPM from TS-CAN inference
                     TSCANInference.InferenceResult result = tscanInference.getCurrentBPM();
-
-                    // Cache last frame as base64 JPEG for watermark embedding
-                    if (isRPPGSessionActive) {
-                        try {
-                            Bitmap snapBmp = yuvToBitmap(frameData, width, height, rotation);
-                            if (snapBmp != null) {
-                                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                                snapBmp.compress(Bitmap.CompressFormat.JPEG, 90, baos);
-                                snapBmp.recycle();
-                                lastFrameBase64 = android.util.Base64.encodeToString(
-                                    baos.toByteArray(), android.util.Base64.NO_WRAP);
-                            }
-                        } catch (Exception snapErr) {
-                            // Non-fatal
-                        }
-                    }
                     
                     // Create result map
                     WritableMap map = Arguments.createMap();
@@ -611,6 +621,14 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
                     map.putInt("facesDetected", facesDetected);
                     map.putInt("width", width);
                     map.putInt("height", height);
+
+                    // Track BPM history for HRV and parse liveness from C++
+                    if (result.isValid && result.bpm > 30) {
+                        bpmHistory.add(result.bpm);
+                    }
+                    boolean liveness = json.optBoolean("liveness", false);
+                    lastLivenessState = liveness;
+                    map.putBoolean("liveness", liveness);
                     
                     if (result.isValid) {
                         map.putInt("inferenceTime", (int) result.inferenceTimeMs);
@@ -778,6 +796,21 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
             json.put("contentLabel", contentLabel);
             json.put("contentConfidence", Math.round(contentConfidence * 100) / 100.0);
 
+            // Anti-spoofing: compute HRV (BPM std dev) and include liveness
+            float bpmStdDev = 0f;
+            if (bpmHistory.size() >= 3) {
+                float sum = 0f;
+                for (float v : bpmHistory) sum += v;
+                float mean = sum / bpmHistory.size();
+                float varSum = 0f;
+                for (float v : bpmHistory) varSum += (v - mean) * (v - mean);
+                bpmStdDev = (float) Math.sqrt(varSum / bpmHistory.size());
+            }
+            json.put("bpmVariability", Math.round(bpmStdDev * 100) / 100.0);
+            json.put("livenessDetected", lastLivenessState);
+            json.put("antiSpoofPassed", lastLivenessState && bpmStdDev > 1.5);
+            bpmHistory.clear();
+
             android.util.Log.i("BioVault", "rPPG session stopped — BPM=" + Math.round(avgBPM)
                 + " frames=" + rppgFrameCount + " hash=" + videoHash.substring(0, Math.min(18, videoHash.length())) + "...");
 
@@ -821,7 +854,21 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
             String hardwareID = getResolvedHardwareDNA();
 
             // Generate anchor hash via C++ (BLAKE3 of frame data + BPM + hardwareID)
-            String proofHash = generateAnchorHash("", bpm, hardwareID);
+            String proofJson = generateAnchorHash("", bpm, hardwareID);
+
+            // Parse the hash from the JSON response
+            String proofHash = proofJson;
+            try {
+                org.json.JSONObject parsed = new org.json.JSONObject(proofJson);
+                if (parsed.has("hash")) {
+                    proofHash = parsed.getString("hash");
+                } else if (parsed.has("error")) {
+                    proofHash = "";
+                    android.util.Log.w("BioVault", "Anchor hash error: " + parsed.getString("error"));
+                }
+            } catch (org.json.JSONException je) {
+                // Not JSON — use as-is
+            }
 
             // Create bio-signature: composite of BPM + hardware + StrongBox sign
             byte[] bioSigBytes = null;
@@ -1366,6 +1413,168 @@ public class BioVaultModule extends ReactContextBaseJavaModule {
             }
         } catch (Exception e) {
             promise.reject("WM_ERROR", e.getMessage());
+        }
+    }
+
+    // ============================================
+    // Composite Risk Score (Phase 6)
+    // ============================================
+
+    /**
+     * Compute a 0–100 risk score from all capture signals.
+     * Called from JS with the aggregated capture data.
+     */
+    @ReactMethod
+    public void computeRiskScore(
+            double bpm,
+            double bpmConfidence,
+            String deviceFingerprint,
+            boolean watermarkEmbedded,
+            boolean consentVerified,
+            int consentSignatures,
+            String contentCategory,
+            String videoHash,
+            String bioSignature,
+            String proofOfRealityHash,
+            boolean livenessDetected,
+            double bpmVariability,
+            Promise promise) {
+        try {
+            boolean hasSBKey = false;
+            try {
+                hasSBKey = strongBoxManager != null && strongBoxManager.hasRealityKey();
+            } catch (Exception ignored) {}
+
+            CaptureProof proof = new CaptureProof.Builder()
+                .bpm((float) bpm)
+                .bpmConfidence((float) bpmConfidence)
+                .deviceFingerprint(deviceFingerprint)
+                .watermarkEmbedded(watermarkEmbedded)
+                .consentVerified(consentVerified)
+                .consentSignatures(consentSignatures)
+                .strongBoxSigned(hasSBKey && bioSignature != null && !bioSignature.isEmpty())
+                .contentCategory(contentCategory)
+                .videoHash(videoHash)
+                .bioSignature(bioSignature)
+                .proofOfRealityHash(proofOfRealityHash)
+                .livenessDetected(livenessDetected)
+                .bpmVariability((float) bpmVariability)
+                .build();
+
+            promise.resolve(proof.toJSON().toString());
+        } catch (Exception e) {
+            promise.reject("RISK_SCORE_ERROR", e.getMessage());
+        }
+    }
+
+    // ============================================
+    // Privacy Shield — BLE VitalsID + Violation Detection
+    // ============================================
+
+    /**
+     * Start the Privacy Shield foreground service — broadcasts VitalsID via BLE
+     * so nearby capturers can detect this subject.
+     */
+    @ReactMethod
+    public void startPrivacyShield(String vitalsIdHash, Promise promise) {
+        try {
+            android.content.Intent intent = new android.content.Intent(reactContext, PrivacyShieldService.class);
+            intent.putExtra(PrivacyShieldService.EXTRA_VITALS_ID, vitalsIdHash);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                reactContext.startForegroundService(intent);
+            } else {
+                reactContext.startService(intent);
+            }
+            android.util.Log.i("BioVault", "[PrivacyShield] Service started with VitalsID: " + vitalsIdHash.substring(0, Math.min(8, vitalsIdHash.length())));
+            promise.resolve(true);
+        } catch (Exception e) {
+            android.util.Log.e("BioVault", "[PrivacyShield] Failed to start service: " + e.getMessage());
+            promise.reject("PRIVACY_SHIELD_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * Stop the Privacy Shield foreground service.
+     */
+    @ReactMethod
+    public void stopPrivacyShield(Promise promise) {
+        try {
+            android.content.Intent intent = new android.content.Intent(reactContext, PrivacyShieldService.class);
+            reactContext.stopService(intent);
+            android.util.Log.i("BioVault", "[PrivacyShield] Service stopped");
+            promise.resolve(true);
+        } catch (Exception e) {
+            promise.reject("PRIVACY_SHIELD_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * Scan for nearby VitalsID beacons for a short window.
+     * Returns an array of detected VitalsID hashes.
+     */
+    @ReactMethod
+    public void scanNearbyVitalsIds(int durationMs, Promise promise) {
+        try {
+            ConsentBroadcaster cb = getOrCreateBroadcaster();
+            cb.startVitalsIdScan(null);
+
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+                try {
+                    java.util.Map<String, Long> detected = cb.getDetectedVitalsIds();
+                    cb.stopVitalsIdScan();
+
+                    WritableArray arr = Arguments.createArray();
+                    for (String id : detected.keySet()) {
+                        arr.pushString(id);
+                    }
+                    android.util.Log.i("BioVault", "[PrivacyShield] Scan complete: " + detected.size() + " VitalsIDs detected");
+                    promise.resolve(arr);
+                } catch (Exception e) {
+                    promise.reject("SCAN_ERROR", e.getMessage());
+                }
+            }, Math.min(durationMs, 10000)); // cap at 10s
+        } catch (Exception e) {
+            promise.reject("SCAN_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * Get this device's VitalsID — a BLAKE3 hash of the hardware fingerprint.
+     * Used as the subject's identity for Privacy Shield beacons.
+     */
+    @ReactMethod
+    public void getVitalsId(Promise promise) {
+        try {
+            String dna = getResolvedHardwareDNA();
+            // Use first 16 chars of hardware DNA as VitalsID
+            String vitalsId = (dna != null && !dna.isEmpty())
+                    ? dna.substring(0, Math.min(16, dna.length()))
+                    : Build.FINGERPRINT.hashCode() + "_fallback";
+            promise.resolve(vitalsId);
+        } catch (Exception e) {
+            promise.reject("VITALS_ID_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * Check if Privacy Shield service is currently running.
+     */
+    @ReactMethod
+    public void isPrivacyShieldActive(Promise promise) {
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) reactContext.getSystemService(android.content.Context.ACTIVITY_SERVICE);
+            boolean running = false;
+            if (am != null) {
+                for (android.app.ActivityManager.RunningServiceInfo service : am.getRunningServices(Integer.MAX_VALUE)) {
+                    if (PrivacyShieldService.class.getName().equals(service.service.getClassName())) {
+                        running = true;
+                        break;
+                    }
+                }
+            }
+            promise.resolve(running);
+        } catch (Exception e) {
+            promise.resolve(false);
         }
     }
 }
