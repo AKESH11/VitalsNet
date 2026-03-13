@@ -7,8 +7,8 @@
  */
 
 const FIREBASE_CONFIG = {
-  projectId: 'vitalsnet-1133e',
-  apiKey: 'AIzaSyAAY1UJ7jVd9FEKJWly0hbUxzp0pcpAvtA',
+  projectId: '#',
+  apiKey: '#',
 };
 
 const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents`;
